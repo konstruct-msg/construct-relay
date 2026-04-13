@@ -1,0 +1,19 @@
+services:
+  relay:
+    image: ghcr.io/OWNER/construct-relay:latest
+    ports:
+      - "${LISTEN_PORT:-443}:443"
+    volumes:
+      - relay_data:/data
+    environment:
+      UPSTREAM: ${UPSTREAM}
+      COVER_SITE: ${COVER_SITE:-cloudflare.com:443}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  relay_data:

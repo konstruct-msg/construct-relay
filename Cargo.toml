@@ -1,0 +1,26 @@
+[package]
+name = "construct-relay"
+version = "0.1.0"
+edition = "2024"
+description = "One-command obfs4 relay for Construct messenger — deploys in minutes, no TLS certs or nginx required"
+license = "MIT"
+
+[[bin]]
+name = "construct-relay"
+path = "src/main.rs"
+
+[dependencies]
+construct-ice = { git = "https://github.com/maximeliseyev/construct-ice" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Uncomment for local development against a checked-out construct-ice:
+# [patch."https://github.com/maximeliseyev/construct-ice"]
+# construct-ice = { path = "../construct-ice" }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
