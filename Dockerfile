@@ -1,10 +1,10 @@
 # ── Build stage ────────────────────────────────────────────────────────────────
-FROM rust:1.87-slim AS builder
+FROM rust:latest AS builder
 
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config git ca-certificates \
+    pkg-config git ca-certificates cmake clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock* ./
