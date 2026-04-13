@@ -7,7 +7,8 @@ services:
       - relay_data:/data
     environment:
       UPSTREAM: ${UPSTREAM}
-      COVER_SITE: ${COVER_SITE:-cloudflare.com:443}
+      STATE_DIR: /data
+      TLS_SNI_HOST: ${TLS_SNI_HOST:-storage.yandexcloud.net}
     restart: unless-stopped
     logging:
       driver: "json-file"

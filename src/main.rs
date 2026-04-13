@@ -1,17 +1,20 @@
+mod tls;
+
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use construct_ice::{
-    Obfs4Listener, Obfs4Stream, ServerConfig,
-    transport::cover::{CoverProxyConfig, MixedAccept},
-};
+use construct_ice::{Obfs4Listener, Obfs4Stream, ServerConfig};
 use tokio::net::TcpStream;
+use tokio_rustls::server::TlsStream;
 use tracing::{error, info, warn};
 
-const DEFAULT_LISTEN: &str = "0.0.0.0:443";
-const DEFAULT_STATE: &str = "/data/relay.key";
-const DEFAULT_COVER: &str = "cloudflare.com:443";
+const DEFAULT_LISTEN:     &str = "0.0.0.0:443";
+const DEFAULT_STATE:      &str = "/data";
+const DEFAULT_SNI:        &str = "storage.yandexcloud.net";
+const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,61 +25,82 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let upstream = std::env::var("UPSTREAM")
+    let upstream  = std::env::var("UPSTREAM")
         .context("UPSTREAM env var required (e.g. ams.konstruct.cc:443)")?;
-    let listen = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
-    let state = std::env::var("STATE_FILE").unwrap_or_else(|_| DEFAULT_STATE.to_string());
-    let cover = std::env::var("COVER_SITE").unwrap_or_else(|_| DEFAULT_COVER.to_string());
+    let listen    = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
+    let state_dir = std::env::var("STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE.to_string());
+    let sni       = std::env::var("TLS_SNI_HOST").unwrap_or_else(|_| DEFAULT_SNI.to_string());
 
-    let config = load_or_generate(&state)?;
+    let relay_tls = tls::setup(&state_dir, &sni)?;
+    let config    = load_or_generate_obfs4(&state_dir)?;
 
     info!("╔══════════════════════════════════════════════════════════");
     info!("║  construct-relay  v{}", env!("CARGO_PKG_VERSION"));
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  listen    {}", listen);
     info!("║  upstream  {}", upstream);
-    info!("║  cover     {}", cover);
+    info!("║  TLS SNI   {}", sni);
     info!("╠══════════════════════════════════════════════════════════");
-    info!("║  bridge cert (add to iOS app / server config):");
+    info!("║  obfs4 bridge cert:");
     info!("║    {}", config.bridge_cert());
+    info!("╠══════════════════════════════════════════════════════════");
+    info!("║  TLS SPKI fingerprint (→ iOS ICEConfig.mskRelayPinnedSPKI):");
+    info!("║    {}", relay_tls.spki_hex);
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  bridge line:");
     info!("║    {}", config.bridge_line());
     info!("╚══════════════════════════════════════════════════════════");
 
-    let cover_cfg = CoverProxyConfig::new(&cover);
-    let listener = Obfs4Listener::bind(&listen, config).await?;
-    info!("Listening on {}", listen);
+    let listener = Arc::new(Obfs4Listener::bind(&listen, config).await?);
+    info!("Listening on {} (TLS+obfs4 / SNI: {})", listen, sni);
 
     loop {
-        match listener.accept_obfs4_or_proxy(cover_cfg.clone()).await {
-            Ok((MixedAccept::Obfs4(stream), peer)) => {
-                let upstream = upstream.clone();
-                tokio::spawn(relay_conn(stream, peer, upstream));
+        match listener.accept_tcp().await {
+            Ok((tcp, peer)) => {
+                let acceptor  = relay_tls.acceptor.clone();
+                let listener2 = Arc::clone(&listener);
+                let upstream  = upstream.clone();
+                tokio::spawn(async move {
+                    handle_conn(tcp, peer, acceptor, listener2, upstream).await;
+                });
             }
-            Ok((MixedAccept::Proxied(_handle), peer)) => {
-                // Active probe detected — connection is being forwarded to cover site.
-                info!("Active probe from {} → proxied to cover", peer);
-            }
-            Err(e) => warn!("Accept error: {}", e),
+            Err(e) => warn!("TCP accept error: {}", e),
         }
     }
 }
 
+async fn handle_conn(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    tls_acceptor: tokio_rustls::TlsAcceptor,
+    obfs4_listener: Arc<Obfs4Listener>,
+    upstream: String,
+) {
+    let tls_stream = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, tls_acceptor.accept(tcp)).await {
+        Ok(Ok(s))  => s,
+        Ok(Err(e)) => { warn!("TLS handshake failed from {}: {}", peer, e); return; }
+        Err(_)     => { warn!("TLS handshake timed out from {}", peer); return; }
+    };
+
+    let obfs4_stream = match obfs4_listener.accept_stream(tls_stream).await {
+        Ok(s)  => s,
+        Err(e) => { warn!("obfs4 handshake failed from {}: {}", peer, e); return; }
+    };
+
+    relay_conn(obfs4_stream, peer, upstream).await;
+}
+
 async fn relay_conn(
-    stream: Box<Obfs4Stream<TcpStream>>,
+    stream: Obfs4Stream<TlsStream<TcpStream>>,
     peer: SocketAddr,
     upstream: String,
 ) {
-    let up = match TcpStream::connect(&upstream).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Upstream connect failed ({}) for {}: {}", upstream, peer, e);
-            return;
-        }
+    let up = match tokio::net::TcpStream::connect(&upstream).await {
+        Ok(s)  => s,
+        Err(e) => { error!("Upstream connect ({}) for {}: {}", upstream, peer, e); return; }
     };
 
-    let (mut cr, mut cw) = tokio::io::split(*stream);
+    let (mut cr, mut cw) = tokio::io::split(stream);
     let (mut ur, mut uw) = up.into_split();
 
     match tokio::try_join!(
@@ -91,30 +115,25 @@ async fn relay_conn(
 
 fn is_routine_disconnect(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        ConnectionReset | BrokenPipe | ConnectionAborted | UnexpectedEof
-    )
+    matches!(e.kind(), ConnectionReset | BrokenPipe | ConnectionAborted | UnexpectedEof)
 }
 
-fn load_or_generate(path: &str) -> anyhow::Result<ServerConfig> {
-    let p = Path::new(path);
+fn load_or_generate_obfs4(state_dir: &str) -> anyhow::Result<ServerConfig> {
+    let path = format!("{state_dir}/relay.obfs4");
+    let p    = Path::new(&path);
     if p.exists() {
-        let bytes = std::fs::read(p).with_context(|| format!("reading state file {}", path))?;
-        let cfg = ServerConfig::from_bytes(&bytes)
-            .map_err(|e| anyhow::anyhow!("corrupt state file {}: {}", path, e))?;
-        info!("Loaded relay identity from {}", path);
+        let bytes = std::fs::read(p).with_context(|| format!("reading {path}"))?;
+        let cfg   = ServerConfig::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("corrupt obfs4 state file: {}", e))?;
+        info!("Loaded obfs4 identity from {path}");
         Ok(cfg)
     } else {
         let cfg = ServerConfig::generate();
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating state dir {}", parent.display()))?;
-        }
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("creating state dir {state_dir}"))?;
         std::fs::write(p, cfg.to_bytes())
-            .with_context(|| format!("writing state file {}", path))?;
-        info!("Generated new relay identity → {}", path);
+            .with_context(|| format!("writing {path}"))?;
+        info!("Generated new obfs4 identity → {path}");
         Ok(cfg)
     }
 }
-
