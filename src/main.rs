@@ -18,6 +18,12 @@ const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls 0.23 requires explicit provider selection when multiple crypto
+    // backends are compiled in (ring from construct-ice + aws-lc-rs from rcgen).
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install ring CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
