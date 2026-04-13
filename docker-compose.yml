@@ -1,6 +1,6 @@
 services:
   relay:
-    image: ghcr.io/OWNER/construct-relay:latest
+    image: ghcr.io/maximeliseyev/construct-relay:latest
     ports:
       - "${LISTEN_PORT:-443}:443"
     volumes:
