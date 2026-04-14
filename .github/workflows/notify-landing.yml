@@ -1,0 +1,21 @@
+name: Notify landing on deploy
+
+# After every push to main (= new relay image), trigger the landing's
+# SPKI update workflow so the .well-known config is refreshed automatically.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify-landing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger relay SPKI update in construct-landing
+        run: |
+          curl --fail -X POST \
+            -H "Authorization: Bearer ${{ secrets.LANDING_REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/maximeliseyev/construct-landing/dispatches \
+            -d '{"event_type":"relay_cert_rotated","client_payload":{"source":"construct-relay","sha":"${{ github.sha }}"}}'
+          echo "✅ Dispatched relay_cert_rotated to construct-landing"
