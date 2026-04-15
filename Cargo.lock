@@ -122,7 +122,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "construct-ice"
-version = "0.2.4"
+version = "2.1.0"
 dependencies = [
  "base64",
  "bytes",
@@ -133,17 +133,22 @@ dependencies = [
  "pin-project-lite",
  "rand",
  "rand_chacha",
+ "rustls",
+ "rustls-pki-types",
+ "sha1",
  "sha2",
  "siphasher",
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-rustls",
+ "x509-cert",
  "zeroize",
 ]
 
 [[package]]
 name = "construct-relay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "construct-ice",
@@ -276,7 +281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -670,6 +675,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]
