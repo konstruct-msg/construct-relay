@@ -14,6 +14,7 @@ construct-ice = { git = "https://github.com/maximeliseyev/construct-ice", featur
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
+rustls-native-certs = "0.8"
 rcgen = "0.13"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 sha2 = "0.10"
