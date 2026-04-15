@@ -1,6 +1,6 @@
 [package]
 name = "construct-relay"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "One-command obfs4 relay for Construct messenger — deploys in minutes, no TLS certs or nginx required"
 license = "MIT"
@@ -24,8 +24,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Uncomment for local development against a checked-out construct-ice:
-[patch."https://github.com/maximeliseyev/construct-ice"]
-construct-ice = { path = "../construct-ice" }
+# [patch."https://github.com/maximeliseyev/construct-ice"]
+# construct-ice = { path = "../construct-ice" }
 
 [profile.release]
 opt-level = 3
