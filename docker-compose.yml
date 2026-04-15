@@ -7,8 +7,10 @@ services:
       - relay_data:/data
     environment:
       UPSTREAM: ${UPSTREAM}
+      UPSTREAM_TLS: ${UPSTREAM_TLS:-true}
       STATE_DIR: /data
       TLS_SNI_HOST: ${TLS_SNI_HOST:-storage.yandexcloud.net}
+      WT_PATH: ${WT_PATH:-/construct-ice}
     restart: unless-stopped
     logging:
       driver: "json-file"
