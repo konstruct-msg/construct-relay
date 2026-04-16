@@ -1,6 +1,6 @@
 [package]
 name = "construct-relay"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "One-command obfs4 relay for Construct messenger — deploys in minutes, no TLS certs or nginx required"
 license = "MIT"

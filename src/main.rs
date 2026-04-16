@@ -34,9 +34,11 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream     = std::env::var("UPSTREAM")
         .context("UPSTREAM env var required (e.g. ams.konstruct.cc:443)")?;
+    // Default: TLS=true. Almost all deployments target port 443 which requires TLS.
+    // Set UPSTREAM_TLS=false only when upstream is a plain HTTP/2 port (rare, internal).
     let upstream_tls = std::env::var("UPSTREAM_TLS")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
+        .map(|v| !v.eq_ignore_ascii_case("false") && v != "0")
+        .unwrap_or(true);
     let listen    = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
     let state_dir = std::env::var("STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE.to_string());
     let sni       = std::env::var("TLS_SNI_HOST").unwrap_or_else(|_| DEFAULT_SNI.to_string());
