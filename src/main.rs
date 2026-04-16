@@ -191,6 +191,9 @@ fn is_routine_disconnect(e: &std::io::Error) -> bool {
 }
 
 /// Build a rustls ClientConfig that trusts OS/system root certificates.
+/// ALPN is set to ["h2"] so the upstream gRPC server negotiates HTTP/2.
+/// Without this, rustls sends no ALPN extension and the server defaults to
+/// HTTP/1.1, causing an immediate close when it receives the HTTP/2 preface.
 fn make_upstream_tls_config() -> anyhow::Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     let native_certs = rustls_native_certs::load_native_certs();
@@ -202,9 +205,12 @@ fn make_upstream_tls_config() -> anyhow::Result<rustls::ClientConfig> {
     for cert in native_certs.certs {
         roots.add(cert).ok(); // skip invalid certs silently
     }
-    let config = rustls::ClientConfig::builder()
+    let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    // gRPC requires HTTP/2; advertise it via ALPN so the upstream server
+    // negotiates h2 instead of falling back to http/1.1.
+    config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(config)
 }
 
