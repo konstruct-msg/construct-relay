@@ -37,10 +37,15 @@ pub fn setup(state_dir: &str, sni: &str) -> anyhow::Result<RelayTls> {
     let cert = rustls::pki_types::CertificateDer::from(cert_der);
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into());
 
-    let tls_cfg = rustls::ServerConfig::builder()
+    let mut tls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .context("building rustls ServerConfig")?;
+
+    // WebTunnel uses HTTP/1.1 WebSocket upgrade — advertise http/1.1 only so
+    // clients with h2+http/1.1 ALPN negotiate HTTP/1.1 explicitly.  This avoids
+    // any ambiguity if a future client or middlebox tries to speak HTTP/2.
+    tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(RelayTls {
         acceptor: TlsAcceptor::from(Arc::new(tls_cfg)),

@@ -1,8 +1,8 @@
 [package]
 name = "construct-relay"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
-description = "One-command obfs4 relay for Construct messenger — deploys in minutes, no TLS certs or nginx required"
+description = "One-command relay for Construct messenger — deploys in minutes, no TLS certs or nginx required"
 license = "MIT"
 
 [[bin]]
@@ -31,4 +31,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opt-level = 3
 lto = true
 strip = true
-
