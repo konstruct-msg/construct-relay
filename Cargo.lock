@@ -129,7 +129,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 [[package]]
 name = "construct-ice"
 version = "2.1.0"
-source = "git+https://github.com/maximeliseyev/construct-ice#0e72962a7d7f6ce97c9184ceb15b8def33e715e1"
+source = "git+https://github.com/maximeliseyev/construct-ice#a76d76b9a0f74dd9d15e52bc16f79ee3a1ad4966"
 dependencies = [
  "base64",
  "bytes",

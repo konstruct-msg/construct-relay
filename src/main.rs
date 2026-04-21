@@ -3,7 +3,7 @@ mod tls;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use construct_ice::{Obfs4Listener, ServerConfig, WebTunnelServerStream};
@@ -16,6 +16,39 @@ const DEFAULT_STATE:       &str = "/data";
 const DEFAULT_SNI:         &str = "storage.yandexcloud.net";
 const DEFAULT_WT_PATH:     &str = "/construct-ice";
 const TLS_ACCEPT_TIMEOUT:  Duration = Duration::from_secs(10);
+/// Each auth period is 5 minutes. We accept current ± 1 period (±5 min clock drift).
+const AUTH_PERIOD_SECS:    u64    = 300;
+
+/// Compute a WebTunnel path auth token for a given time period.
+///
+/// Both the relay and the iOS client derive the token identically:
+///   `SHA-256( bridge_cert_base64_string || "webtunnel-v1" || period_u64_be )[:8]`
+/// encoded as 16 lowercase hex characters.  The `bridge_cert` string is the
+/// `cert=...` value from the relay's obfs4 bridge line — available to clients
+/// via the relay manifest they download at startup.
+fn webtunnel_token(bridge_cert: &str, period: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bridge_cert.as_bytes());
+    h.update(b"webtunnel-v1");
+    h.update(period.to_be_bytes());
+    hex::encode(&h.finalize()[..8])
+}
+
+/// Return the set of valid authenticated WebTunnel paths for right now.
+/// Accepts current period ± 1 to tolerate up to 5 minutes of clock drift.
+fn valid_wt_paths(bridge_cert: &str, base_path: &str) -> Vec<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let period = now / AUTH_PERIOD_SECS;
+    // period-1, period, period+1
+    [period.saturating_sub(1), period, period + 1]
+        .iter()
+        .map(|&p| format!("{base_path}/{}", webtunnel_token(bridge_cert, p)))
+        .collect()
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -51,8 +84,13 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let relay_tls = tls::setup(&state_dir, &sni)?;
-    let config    = load_or_generate_obfs4(&state_dir)?;
+    let relay_tls   = tls::setup(&state_dir, &sni)?;
+    let config      = load_or_generate_obfs4(&state_dir)?;
+    let bridge_cert = config.bridge_cert();
+
+    // Log the current auth token so operators can verify client-side derivation.
+    let now_period = SystemTime::now()
+        .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / AUTH_PERIOD_SECS;
 
     info!("╔══════════════════════════════════════════════════════════");
     info!("║  construct-relay  v{}", env!("CARGO_PKG_VERSION"));
@@ -60,10 +98,10 @@ async fn main() -> anyhow::Result<()> {
     info!("║  listen    {}", listen);
     info!("║  upstream  {} (TLS: {})", upstream, upstream_tls);
     info!("║  TLS SNI   {}", sni);
-    info!("║  wt_path   {} (WebTunnel v2)", wt_path);
+    info!("║  wt_path   {}/{} (WebTunnel v2, current token)", wt_path, webtunnel_token(&bridge_cert, now_period));
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  obfs4 bridge cert:");
-    info!("║    {}", config.bridge_cert());
+    info!("║    {}", bridge_cert);
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  TLS SPKI fingerprint (→ iOS ICEConfig.mskRelayPinnedSPKI):");
     info!("║    {}", relay_tls.spki_hex);
@@ -78,13 +116,14 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match listener.accept_tcp().await {
             Ok((tcp, peer)) => {
-                let acceptor          = relay_tls.acceptor.clone();
-                let listener2         = Arc::clone(&listener);
-                let upstream          = upstream.clone();
-                let wt_path           = wt_path.clone();
-                let upstream_tls_cfg  = upstream_tls_config.clone();
+                let acceptor         = relay_tls.acceptor.clone();
+                let listener2        = Arc::clone(&listener);
+                let upstream         = upstream.clone();
+                let wt_path          = wt_path.clone();
+                let bridge_cert      = bridge_cert.clone();
+                let upstream_tls_cfg = upstream_tls_config.clone();
                 tokio::spawn(async move {
-                    handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, upstream_tls_cfg).await;
+                    handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, upstream_tls_cfg).await;
                 });
             }
             Err(e) => warn!("TCP accept error: {}", e),
@@ -99,6 +138,7 @@ async fn handle_conn(
     obfs4_listener: Arc<Obfs4Listener>,
     upstream: String,
     wt_path: String,
+    bridge_cert: String,
     upstream_tls: Option<Arc<rustls::ClientConfig>>,
 ) {
     let tls_stream = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, tls_acceptor.accept(tcp)).await {
@@ -118,10 +158,14 @@ async fn handle_conn(
     };
 
     if first == b'G' {
-        // WebTunnel path: perform WebSocket handshake then relay
+        // WebTunnel path: validate time-based auth token derived from bridge cert,
+        // then perform WebSocket handshake and relay.
         info!("WebTunnel connection from {}", peer);
-        match WebTunnelServerStream::accept(buffered, &wt_path).await {
+        let valid_paths = valid_wt_paths(&bridge_cert, &wt_path);
+        match WebTunnelServerStream::accept_validated(buffered, |p| valid_paths.iter().any(|v| v == p)).await {
             Ok(ws) => relay_conn(ws, peer, upstream, upstream_tls).await,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied =>
+                warn!("WebTunnel auth rejected from {}: {}", peer, e),
             Err(e) => warn!("WebTunnel handshake failed from {}: {}", peer, e),
         }
     } else {
