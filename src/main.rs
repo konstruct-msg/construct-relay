@@ -1,8 +1,9 @@
 mod tls;
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -18,6 +19,44 @@ const DEFAULT_WT_PATH:     &str = "/construct-ice";
 const TLS_ACCEPT_TIMEOUT:  Duration = Duration::from_secs(10);
 /// Each auth period is 5 minutes. We accept current ± 1 period (±5 min clock drift).
 const AUTH_PERIOD_SECS:    u64    = 300;
+/// Maximum concurrent connections allowed from a single IP address.
+/// Legitimate clients open at most 1-2 connections (stream + occasional RPC).
+/// This prevents relay resource abuse even by clients that know the bridge cert.
+const MAX_CONNS_PER_IP:    usize  = 8;
+
+// ---------------------------------------------------------------------------
+// Per-IP connection limiter (RAII guard)
+// ---------------------------------------------------------------------------
+
+type ConnTable = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// RAII guard that decrements the per-IP counter when the connection ends.
+struct ConnGuard {
+    ip: IpAddr,
+    table: ConnTable,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut t = self.table.lock().unwrap();
+        match t.get_mut(&self.ip) {
+            Some(n) if *n <= 1 => { t.remove(&self.ip); }
+            Some(n) => { *n -= 1; }
+            None => {}
+        }
+    }
+}
+
+/// Try to acquire a connection slot for `ip`.  Returns `None` if the limit is reached.
+fn try_acquire(table: &ConnTable, ip: IpAddr, max: usize) -> Option<ConnGuard> {
+    let mut t = table.lock().unwrap();
+    let count = t.entry(ip).or_insert(0);
+    if *count >= max {
+        return None;
+    }
+    *count += 1;
+    Some(ConnGuard { ip, table: Arc::clone(table) })
+}
 
 /// Compute a WebTunnel path auth token for a given time period.
 ///
@@ -113,9 +152,19 @@ async fn main() -> anyhow::Result<()> {
     let listener = Arc::new(Obfs4Listener::bind(&listen, config).await?);
     info!("Listening on {} (TLS+obfs4 / WebTunnel / SNI: {})", listen, sni);
 
+    let conn_table: ConnTable = Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         match listener.accept_tcp().await {
             Ok((tcp, peer)) => {
+                let ip = peer.ip();
+                let guard = match try_acquire(&conn_table, ip, MAX_CONNS_PER_IP) {
+                    Some(g) => g,
+                    None => {
+                        warn!("Connection limit ({}) exceeded for {} — dropping", MAX_CONNS_PER_IP, ip);
+                        continue;
+                    }
+                };
                 let acceptor         = relay_tls.acceptor.clone();
                 let listener2        = Arc::clone(&listener);
                 let upstream         = upstream.clone();
@@ -124,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
                 let upstream_tls_cfg = upstream_tls_config.clone();
                 tokio::spawn(async move {
                     handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, upstream_tls_cfg).await;
+                    drop(guard); // release slot when connection ends
                 });
             }
             Err(e) => warn!("TCP accept error: {}", e),
