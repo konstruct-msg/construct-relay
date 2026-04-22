@@ -19,10 +19,11 @@ const DEFAULT_WT_PATH:     &str = "/construct-ice";
 const TLS_ACCEPT_TIMEOUT:  Duration = Duration::from_secs(10);
 /// Each auth period is 5 minutes. We accept current ± 1 period (±5 min clock drift).
 const AUTH_PERIOD_SECS:    u64    = 300;
-/// Maximum concurrent connections allowed from a single IP address.
-/// Legitimate clients open at most 1-2 connections (stream + occasional RPC).
-/// This prevents relay resource abuse even by clients that know the bridge cert.
-const MAX_CONNS_PER_IP:    usize  = 8;
+/// Default maximum concurrent connections per IP if MAX_CONNS_PER_IP env var is not set.
+/// HTTP/2 keepalive + happy-eyeballs dual-relay probing + WebTunnel pre-probe means a
+/// single legitimate client can hold 6–12 simultaneous connections.  Set conservatively
+/// high enough to not rate-limit real clients while still blocking floods.
+const DEFAULT_MAX_CONNS_PER_IP: usize = 24;
 
 // ---------------------------------------------------------------------------
 // Per-IP connection limiter (RAII guard)
@@ -115,6 +116,10 @@ async fn main() -> anyhow::Result<()> {
     let state_dir = std::env::var("STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE.to_string());
     let sni       = std::env::var("TLS_SNI_HOST").unwrap_or_else(|_| DEFAULT_SNI.to_string());
     let wt_path   = std::env::var("WT_PATH").unwrap_or_else(|_| DEFAULT_WT_PATH.to_string());
+    let max_conns_per_ip: usize = std::env::var("MAX_CONNS_PER_IP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONNS_PER_IP);
 
     // Build upstream TLS config once (reused for every connection).
     let upstream_tls_config = if upstream_tls {
@@ -138,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
     info!("║  upstream  {} (TLS: {})", upstream, upstream_tls);
     info!("║  TLS SNI   {}", sni);
     info!("║  wt_path   {}/{} (WebTunnel v2, current token)", wt_path, webtunnel_token(&bridge_cert, now_period));
+    info!("║  max_conns {}/IP", max_conns_per_ip);
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  obfs4 bridge cert:");
     info!("║    {}", bridge_cert);
@@ -158,10 +164,10 @@ async fn main() -> anyhow::Result<()> {
         match listener.accept_tcp().await {
             Ok((tcp, peer)) => {
                 let ip = peer.ip();
-                let guard = match try_acquire(&conn_table, ip, MAX_CONNS_PER_IP) {
+                let guard = match try_acquire(&conn_table, ip, max_conns_per_ip) {
                     Some(g) => g,
                     None => {
-                        warn!("Connection limit ({}) exceeded for {} — dropping", MAX_CONNS_PER_IP, ip);
+                        warn!("Connection limit ({}) exceeded for {} — dropping", max_conns_per_ip, ip);
                         continue;
                     }
                 };
