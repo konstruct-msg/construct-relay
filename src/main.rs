@@ -253,10 +253,14 @@ async fn relay_conn<S: AsyncRead + AsyncWrite + Unpin>(
             Err(e) => { error!("Invalid upstream hostname '{}': {}", hostname, e); return; }
         };
         match connector.connect(server_name, tcp).await {
-            Ok(tls_stream) => pipe(stream, tls_stream, peer).await,
+            Ok(tls_stream) => {
+                info!("Relay {} → upstream {} (TLS) connected", peer, upstream);
+                pipe(stream, tls_stream, peer).await;
+            }
             Err(e) => error!("Upstream TLS handshake to {} failed: {}", upstream, e),
         }
     } else {
+        info!("Relay {} → upstream {} (plain) connected", peer, upstream);
         pipe(stream, tcp, peer).await;
     }
 }
