@@ -16,6 +16,11 @@ const DEFAULT_LISTEN:      &str = "0.0.0.0:443";
 const DEFAULT_STATE:       &str = "/data";
 const DEFAULT_SNI:         &str = "storage.yandexcloud.net";
 const DEFAULT_WT_PATH:     &str = "/construct-ice";
+/// Secondary listener port for direct TLS+obfs4 connections that bypass CDN.
+/// Set ALT_LISTEN_ADDR=0.0.0.0:9443 on CDN-fronted relays (e.g. MSK/Yandex Cloud)
+/// so mobile clients can reach the relay without going through the CDN layer.
+/// Uses the same TLS cert, obfs4 identity, and upstream as the primary listener.
+const DEFAULT_ALT_LISTEN:  &str = "";
 const TLS_ACCEPT_TIMEOUT:  Duration = Duration::from_secs(10);
 /// Each auth period is 5 minutes. We accept current ± 1 period (±5 min clock drift).
 const AUTH_PERIOD_SECS:    u64    = 300;
@@ -113,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| !v.eq_ignore_ascii_case("false") && v != "0")
         .unwrap_or(true);
     let listen    = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
+    let alt_listen = std::env::var("ALT_LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_ALT_LISTEN.to_string());
     let state_dir = std::env::var("STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE.to_string());
     let sni       = std::env::var("TLS_SNI_HOST").unwrap_or_else(|_| DEFAULT_SNI.to_string());
     let wt_path   = std::env::var("WT_PATH").unwrap_or_else(|_| DEFAULT_WT_PATH.to_string());
@@ -140,6 +146,9 @@ async fn main() -> anyhow::Result<()> {
     info!("║  construct-relay  v{}", env!("CARGO_PKG_VERSION"));
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  listen    {}", listen);
+    if !alt_listen.is_empty() {
+        info!("║  alt-listen {} (TLS+obfs4, CDN bypass)", alt_listen);
+    }
     info!("║  upstream  {} (TLS: {})", upstream, upstream_tls);
     info!("║  TLS SNI   {}", sni);
     info!("║  wt_path   {}/{} (WebTunnel v2, current token)", wt_path, webtunnel_token(&bridge_cert, now_period));
@@ -159,6 +168,52 @@ async fn main() -> anyhow::Result<()> {
     info!("Listening on {} (TLS+obfs4 / WebTunnel / SNI: {})", listen, sni);
 
     let conn_table: ConnTable = Arc::new(Mutex::new(HashMap::new()));
+
+    // Optional secondary listener: bypasses CDN so raw TLS+obfs4 connections can
+    // reach the relay directly.  Shares the same obfs4 identity and TLS cert as the
+    // primary listener — clients pin the same SPKI fingerprint regardless of port.
+    // Typical deployment: ALT_LISTEN_ADDR=0.0.0.0:9443 on a CDN-fronted relay.
+    if !alt_listen.is_empty() {
+        let alt_tcp = tokio::net::TcpListener::bind(&alt_listen).await
+            .with_context(|| format!("binding ALT_LISTEN_ADDR {alt_listen}"))?;
+        info!("Alt listener on {} (TLS+obfs4 direct, CDN bypass)", alt_listen);
+
+        let listener_alt    = Arc::clone(&listener);
+        let tls_alt         = relay_tls.acceptor.clone();
+        let upstream_alt    = upstream.clone();
+        let wt_path_alt     = wt_path.clone();
+        let bridge_cert_alt = bridge_cert.clone();
+        let conn_table_alt  = Arc::clone(&conn_table);
+        let tls_config_alt  = upstream_tls_config.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match alt_tcp.accept().await {
+                    Ok((tcp, peer)) => {
+                        let ip = peer.ip();
+                        let guard = match try_acquire(&conn_table_alt, ip, max_conns_per_ip) {
+                            Some(g) => g,
+                            None => {
+                                warn!("Alt connection limit ({}) exceeded for {} — dropping", max_conns_per_ip, ip);
+                                continue;
+                            }
+                        };
+                        let acceptor     = tls_alt.clone();
+                        let listener2    = Arc::clone(&listener_alt);
+                        let upstream     = upstream_alt.clone();
+                        let wt_path      = wt_path_alt.clone();
+                        let bridge_cert  = bridge_cert_alt.clone();
+                        let tls_cfg      = tls_config_alt.clone();
+                        tokio::spawn(async move {
+                            handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, tls_cfg).await;
+                            drop(guard);
+                        });
+                    }
+                    Err(e) => warn!("Alt listener TCP accept error: {}", e),
+                }
+            }
+        });
+    }
 
     loop {
         match listener.accept_tcp().await {

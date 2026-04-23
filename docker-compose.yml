@@ -3,6 +3,7 @@ services:
     image: ghcr.io/maximeliseyev/construct-relay:latest
     ports:
       - "${LISTEN_PORT:-443}:443"
+      - "${ALT_LISTEN_PORT:-9443}:9443"
     volumes:
       - relay_data:/data
     environment:
@@ -11,6 +12,7 @@ services:
       STATE_DIR: /data
       TLS_SNI_HOST: ${TLS_SNI_HOST:-storage.yandexcloud.net}
       WT_PATH: ${WT_PATH:-/construct-ice}
+      ALT_LISTEN_ADDR: ${ALT_LISTEN_ADDR:-0.0.0.0:9443}
     restart: unless-stopped
     logging:
       driver: "json-file"
