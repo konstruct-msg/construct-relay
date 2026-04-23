@@ -2,17 +2,22 @@ services:
   relay:
     image: ghcr.io/maximeliseyev/construct-relay:latest
     ports:
-      - "${LISTEN_PORT:-443}:443"
-      - "${ALT_LISTEN_PORT:-9443}:9443"
+      # LISTEN_PORT controls the external host port.
+      # Container always listens on 443 internally; Docker maps it out.
+      # Set LISTEN_PORT=9894 (or any open port) to avoid well-known port scanning.
+      - "${LISTEN_PORT:-9894}:443"
     volumes:
       - relay_data:/data
     environment:
       UPSTREAM: ${UPSTREAM}
       UPSTREAM_TLS: ${UPSTREAM_TLS:-true}
       STATE_DIR: /data
-      TLS_SNI_HOST: ${TLS_SNI_HOST:-storage.yandexcloud.net}
-      WT_PATH: ${WT_PATH:-/construct-ice}
-      ALT_LISTEN_ADDR: ${ALT_LISTEN_ADDR:-0.0.0.0:9443}
+      # TLS SNI: pick a domain plausible for the VPS host's network range.
+      # Examples: fra1.digitaloceanspaces.com (DE/FI), s3.eu-west-1.amazonaws.com (EU)
+      TLS_SNI_HOST: ${TLS_SNI_HOST:-fra1.digitaloceanspaces.com}
+      # WebTunnel disabled by default on new relays — enable only with real CDN fronting.
+      # Without a CDN, WebTunnel triggers active probing which gets the IP blocked.
+      WT_PATH: ${WT_PATH:-}
     restart: unless-stopped
     logging:
       driver: "json-file"
