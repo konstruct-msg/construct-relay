@@ -1,53 +1,32 @@
 {
-  "bundle_signing_algorithm": "Ed25519",
-  "bundle_signing_key": "kDGyaafEFExKTdB7MJXl4xYf0pFnxEg7bZJh7BDP9LI=",
-  "capabilities": {
-    "max_file_size_bytes": 104857600,
-    "max_message_size_bytes": 65536,
-    "supports_grpc_web": true,
-    "supports_pq_crypto": true,
-    "supports_streaming": true
-  },
-  "grpc_endpoint": "ams.konstruct.cc:443",
+  "version": 1,
+  "signed_at": 1777023883,
+  "bundle_signing_key": null,
   "ice": {
-    "primary": "ice.ams.konstruct.cc:443",
     "relays": [
       {
-        "addr": "158.160.140.67",
-        "bridge_cert": "IZKOsDNS5gld2g1PH4Uo4Yna/ltepGKpzDQTbSJll9OqzMin6yZaNx4gFbiLTvuGbABpcA",
-        "domain": "ice.msk.konstruct.cc",
-        "id": "msk",
+        "id": "ams-het-1",
+        "addr": "ice.ams.konstruct.cc",
         "port": 443,
-        "region": {
-          "tz_offset_max": 3,
-          "tz_offset_min": 3
-        },
-        "sni": "storage.yandexcloud.net",
-        "spki_sha256": "ce2bbfcac1fffab1f4f41ee540aee2dea92c523f7768264aeb87184bf8bfa723",
-        "wt_host_header": "ice.msk.konstruct.cc",
-        "wt_path": "/construct-ice"
+        "domain": "ams-het-1.relay.konstruct.cc",
+        "sni": "ice.ams.konstruct.cc",
+        "spki_sha256": "510d465a5c4736548e3386570ede6ba24600c4c9a2e369d24dde1ad7915eeebd",
+        "bridge_cert": "voFt3ilLSKx2xYuZsjxOnXtHTktUE4EaExIYRG+Bh89frHzI5QVrBNvT41zdS7Maiu6gPA",
+        "wt_path": "/construct-ice",
+        "region": "NL"
+      },
+      {
+        "id": "spb-mt-1",
+        "addr": "45.135.233.5",
+        "port": 9894,
+        "domain": "spb-mt-1.relay.konstruct.cc",
+        "sni": "s3.vkcs.cloud",
+        "spki_sha256": "bd2da0c781a0fc98d85640bd87d2d4709c709a50b6bee06f90282ca6237f3410",
+        "bridge_cert": "vkHsS7HOg1e8D9UPfLCQ4G8oLFfy6t/6oBXdAU4oUvPTMWTWZo0kiw6dq28cssjE24OUOw",
+        "wt_path": null,
+        "region": "RU"
       }
     ]
   },
-  "limits": {
-    "max_media_size_bytes": 104857600,
-    "max_message_size_bytes": 65536,
-    "rate_limit_messages_per_hour": 1000
-  },
-  "protocol": "grpc",
-  "server": {
-    "domain": "ams.konstruct.cc",
-    "version": "0.9.12"
-  },
-  "services": [
-    "auth.AuthService",
-    "user.UserService",
-    "messaging.MessagingService",
-    "notification.NotificationService",
-    "invite.InviteService",
-    "media.MediaService"
-  ],
-  "signature": "ed25519:Vl4AfuaiTcJiDdMtaHEu7hRJdkcUbxrXW2huv4x-xMQPfPZ4A53tK4Pl2enBt4Ehzd2WuvVr82L5erdIi43uAw",
-  "signed_at": "2026-04-16T14:18:02Z",
-  "version": "1.1"
+  "signature": "ed25519:3I4awajwibuS7iW3aRZCrqeumAeGs-oj9zVHzvHiQuQOXeKyPAxI2mk2KI5oc9VzyLnJ3AfV8r4TRyQqXBHkBg"
 }
