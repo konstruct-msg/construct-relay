@@ -1,32 +1,68 @@
 {
-  "version": 1,
-  "signed_at": 1777023883,
-  "bundle_signing_key": null,
+  "bundle_signing_algorithm": "Ed25519",
+  "bundle_signing_key": "kDGyaafEFExKTdB7MJXl4xYf0pFnxEg7bZJh7BDP9LI=",
+  "capabilities": {
+    "max_file_size_bytes": 104857600,
+    "max_message_size_bytes": 65536,
+    "supports_grpc_web": true,
+    "supports_pq_crypto": true,
+    "supports_streaming": true
+  },
+  "grpc_endpoint": "ams.konstruct.cc:443",
   "ice": {
+    "primary": "ice.ams.konstruct.cc:443",
     "relays": [
       {
-        "id": "ams-het-1",
         "addr": "ice.ams.konstruct.cc",
-        "port": 443,
+        "bridge_cert": "voFt3ilLSKx2xYuZsjxOnXtHTktUE4EaExIYRG+Bh89frHzI5QVrBNvT41zdS7Maiu6gPA",
         "domain": "ams-het-1.relay.konstruct.cc",
+        "id": "ams-het-1",
+        "port": 443,
+        "region": {
+          "tz_offset_max": 1,
+          "tz_offset_min": 1
+        },
         "sni": "ice.ams.konstruct.cc",
         "spki_sha256": "510d465a5c4736548e3386570ede6ba24600c4c9a2e369d24dde1ad7915eeebd",
-        "bridge_cert": "voFt3ilLSKx2xYuZsjxOnXtHTktUE4EaExIYRG+Bh89frHzI5QVrBNvT41zdS7Maiu6gPA",
-        "wt_path": "/construct-ice",
-        "region": "NL"
+        "wt_host_header": "ice.ams.konstruct.cc",
+        "wt_path": "/construct-ice"
       },
       {
-        "id": "spb-mt-1",
         "addr": "45.135.233.5",
-        "port": 9894,
+        "bridge_cert": "vkHsS7HOg1e8D9UPfLCQ4G8oLFfy6t/6oBXdAU4oUvPTMWTWZo0kiw6dq28cssjE24OUOw",
         "domain": "spb-mt-1.relay.konstruct.cc",
+        "id": "spb-mt-1",
+        "port": 52143,
+        "region": {
+          "tz_offset_max": 3,
+          "tz_offset_min": 3
+        },
         "sni": "s3.vkcs.cloud",
         "spki_sha256": "bd2da0c781a0fc98d85640bd87d2d4709c709a50b6bee06f90282ca6237f3410",
-        "bridge_cert": "vkHsS7HOg1e8D9UPfLCQ4G8oLFfy6t/6oBXdAU4oUvPTMWTWZo0kiw6dq28cssjE24OUOw",
-        "wt_path": null,
-        "region": "RU"
+        "wt_host_header": null,
+        "wt_path": null
       }
     ]
   },
-  "signature": "ed25519:3I4awajwibuS7iW3aRZCrqeumAeGs-oj9zVHzvHiQuQOXeKyPAxI2mk2KI5oc9VzyLnJ3AfV8r4TRyQqXBHkBg"
+  "limits": {
+    "max_media_size_bytes": 104857600,
+    "max_message_size_bytes": 65536,
+    "rate_limit_messages_per_hour": 1000
+  },
+  "protocol": "grpc",
+  "server": {
+    "domain": "ams.konstruct.cc",
+    "version": "0.9.12"
+  },
+  "services": [
+    "auth.AuthService",
+    "user.UserService",
+    "messaging.MessagingService",
+    "notification.NotificationService",
+    "invite.InviteService",
+    "media.MediaService"
+  ],
+  "signature": "ed25519:aJ1KIwCckVO1CLSVkAc_trTRNB4WhnZ9e5u0n9rk8zbZmRIAdqskkI9KL2D43-0QN-rQJaZTZfycKGEXAve-Bw",
+  "signed_at": "2026-04-27T18:54:04Z",
+  "version": "1.1"
 }
