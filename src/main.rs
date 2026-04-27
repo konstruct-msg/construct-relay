@@ -273,11 +273,32 @@ async fn handle_conn(
         // then perform WebSocket handshake and relay.
         info!("WebTunnel connection from {}", peer);
         let valid_paths = valid_wt_paths(&bridge_cert, &wt_path);
-        match WebTunnelServerStream::accept_validated(buffered, |p| valid_paths.iter().any(|v| v == p)).await {
-            Ok(ws) => relay_conn(ws, peer, upstream, upstream_tls).await,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied =>
-                warn!("WebTunnel auth rejected from {}: {}", peer, e),
-            Err(e) => warn!("WebTunnel handshake failed from {}: {}", peer, e),
+
+        // Peek at the HTTP request path without consuming the buffer.
+        // fill_buf() fills the internal 8 KiB buffer but does NOT advance the read
+        // position, so accept_validated() will see the same bytes on its own reads.
+        let path_ok = {
+            use tokio::io::AsyncBufReadExt;
+            match buffered.fill_buf().await {
+                Ok(buf) => extract_http_path(buf)
+                    .map(|p| valid_paths.iter().any(|v| v == p))
+                    .unwrap_or(false),
+                Err(_) => false,
+            }
+        };
+
+        if path_ok {
+            match WebTunnelServerStream::accept_validated(buffered, |p| valid_paths.iter().any(|v| v == p)).await {
+                Ok(ws) => relay_conn(ws, peer, upstream, upstream_tls).await,
+                Err(e) => warn!("WebTunnel handshake failed from {}: {}", peer, e),
+            }
+        } else {
+            // Unknown path: delay then respond as a generic nginx server.
+            // The delay makes automated path enumeration ~500× slower.
+            // The HTTP response hides the relay from internet scanners (Shodan, Censys).
+            warn!("WebTunnel auth rejected from {} — sending decoy response", peer);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            send_decoy_http_response(&mut buffered).await;
         }
     } else {
         // obfs4 path: existing encrypted transport
@@ -292,6 +313,47 @@ async fn peek_first_byte<S: AsyncRead + Unpin>(reader: &mut tokio::io::BufReader
     use tokio::io::AsyncBufReadExt;
     let buf = reader.fill_buf().await?;
     buf.first().copied().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty TLS stream"))
+}
+
+/// Extract the HTTP request path from bytes already in the BufReader's buffer.
+/// Parses the request line "GET /path HTTP/1.1" and returns "/path".
+/// Does not advance the buffer's read position.
+fn extract_http_path(buf: &[u8]) -> Option<&str> {
+    let line_end = buf.iter().position(|&b| b == b'\r' || b == b'\n')?;
+    let line = std::str::from_utf8(&buf[..line_end]).ok()?;
+    let mut parts = line.splitn(3, ' ');
+    let _method = parts.next()?;
+    parts.next()
+}
+
+/// Respond with a minimal nginx-like 404 page to hide the relay from internet scanners.
+/// Called when a WebTunnel connection arrives with an invalid (unrecognised) path.
+/// Using `reader.get_mut()` writes directly to the underlying TLS stream without
+/// disturbing the BufReader's unread buffer (which the scanner never reads anyway).
+async fn send_decoy_http_response<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut tokio::io::BufReader<S>,
+) {
+    use tokio::io::AsyncWriteExt;
+    // Matches the default nginx 404 page byte-for-byte (body length = 153 bytes).
+    const BODY: &[u8] = b"<html>\r\n\
+<head><title>404 Not Found</title></head>\r\n\
+<body>\r\n\
+<center><h1>404 Not Found</h1></center>\r\n\
+<hr><center>nginx/1.24.0</center>\r\n\
+</body>\r\n\
+</html>\r\n";
+    let head = format!(
+        "HTTP/1.1 404 Not Found\r\n\
+Server: nginx/1.24.0\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+        BODY.len()
+    );
+    let stream = reader.get_mut();
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(BODY).await;
+    let _ = stream.flush().await;
 }
 
 async fn relay_conn<S: AsyncRead + AsyncWrite + Unpin>(
