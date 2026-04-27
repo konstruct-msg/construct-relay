@@ -2,10 +2,11 @@ services:
   relay:
     image: ghcr.io/maximeliseyev/construct-relay:latest
     ports:
-      # LISTEN_PORT controls the external host port.
-      # Container always listens on 443 internally; Docker maps it out.
-      # Set LISTEN_PORT=9894 (or any open port) to avoid well-known port scanning.
-      - "${LISTEN_PORT:-9894}:443"
+      # Primary listener: container :443 → host :443 (or LISTEN_PORT override)
+      - "${LISTEN_PORT:-443}:443"
+      # Alt listener: direct obfs4 bypass (no CDN). Container binds :9894 internally,
+      # mapped to ALT_LISTEN_PORT on the host (default: 52143).
+      - "${ALT_LISTEN_PORT:-52143}:9894"
     volumes:
       - relay_data:/data
     environment:
@@ -13,11 +14,11 @@ services:
       UPSTREAM_TLS: ${UPSTREAM_TLS:-true}
       STATE_DIR: /data
       # TLS SNI: pick a domain plausible for the VPS host's network range.
-      # Examples: fra1.digitaloceanspaces.com (DE/FI), s3.eu-west-1.amazonaws.com (EU)
       TLS_SNI_HOST: ${TLS_SNI_HOST:-fra1.digitaloceanspaces.com}
-      # WebTunnel disabled by default on new relays — enable only with real CDN fronting.
-      # Without a CDN, WebTunnel triggers active probing which gets the IP blocked.
+      # WebTunnel: enable only with real CDN fronting (bare IP triggers active probing).
       WT_PATH: ${WT_PATH:-}
+      # Alt obfs4 listener inside container (mapped to ALT_LISTEN_PORT on host).
+      ALT_LISTEN_ADDR: ${ALT_LISTEN_ADDR:-0.0.0.0:9894}
     restart: unless-stopped
     logging:
       driver: "json-file"
