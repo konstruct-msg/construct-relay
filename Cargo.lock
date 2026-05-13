@@ -128,8 +128,8 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "construct-ice"
-version = "2.2.0"
-source = "git+https://github.com/maximeliseyev/construct-ice#c1fe50c0553b241fded1e57a25a885928ffed5b2"
+version = "2.3.0"
+source = "git+https://github.com/maximeliseyev/construct-ice#e731188a28ce5c111c2f198a24f1169463bfb8bb"
 dependencies = [
  "base64",
  "bytes",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "construct-relay"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "construct-ice",

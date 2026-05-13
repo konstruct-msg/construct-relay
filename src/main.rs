@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use construct_ice::{Obfs4Listener, ServerConfig, WebTunnelServerStream};
@@ -29,6 +29,12 @@ const AUTH_PERIOD_SECS:    u64    = 300;
 /// single legitimate client can hold 6–12 simultaneous connections.  Set conservatively
 /// high enough to not rate-limit real clients while still blocking floods.
 const DEFAULT_MAX_CONNS_PER_IP: usize = 24;
+/// Auth failures within this window count toward the threshold.
+const AUTH_FAIL_WINDOW:     Duration = Duration::from_secs(3_600); // 1 hour
+/// Failures within AUTH_FAIL_WINDOW needed to enter cooldown.
+const AUTH_FAIL_THRESHOLD:  usize    = 5;
+/// How long a blocked IP stays in cooldown before being retried.
+const AUTH_FAIL_COOLDOWN:   Duration = Duration::from_secs(3_600); // 1 hour
 
 // ---------------------------------------------------------------------------
 // Per-IP connection limiter (RAII guard)
@@ -62,6 +68,74 @@ fn try_acquire(table: &ConnTable, ip: IpAddr, max: usize) -> Option<ConnGuard> {
     }
     *count += 1;
     Some(ConnGuard { ip, table: Arc::clone(table) })
+}
+
+// ---------------------------------------------------------------------------
+// Per-IP auth-failure rate limiter
+// ---------------------------------------------------------------------------
+//
+// Tracks WebTunnel bad-path rejections and obfs4 HMAC failures per source IP.
+// After AUTH_FAIL_THRESHOLD failures within AUTH_FAIL_WINDOW the IP enters a
+// cooldown: incoming TCP connections are dropped immediately (before TLS),
+// saving CPU on obfs4 key derivation and WebSocket parsing.
+
+#[derive(Default)]
+struct FailEntry {
+    /// Timestamps of recent auth failures (pruned to AUTH_FAIL_WINDOW).
+    failures:       Vec<Instant>,
+    /// If Some, the IP is blocked until this instant.
+    cooldown_until: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct AuthFailTable(Arc<Mutex<HashMap<IpAddr, FailEntry>>>);
+
+impl AuthFailTable {
+    fn new() -> Self { Self(Arc::new(Mutex::new(HashMap::new()))) }
+
+    /// Returns `true` if the IP is currently in cooldown. Lazily evicts expired entries.
+    fn is_blocked(&self, ip: IpAddr) -> bool {
+        let mut map = self.0.lock().unwrap();
+        let now = Instant::now();
+        if let Some(e) = map.get_mut(&ip) {
+            if let Some(until) = e.cooldown_until {
+                if now < until {
+                    return true;
+                }
+                map.remove(&ip); // cooldown expired — clean up
+            }
+        }
+        false
+    }
+
+    /// Record an auth failure for `ip`. Logs a warning if cooldown is newly triggered.
+    fn record_failure(&self, ip: IpAddr) {
+        let newly_blocked;
+        {
+            let mut map = self.0.lock().unwrap();
+            let now = Instant::now();
+            let e = map.entry(ip).or_default();
+            // Drop failures older than the sliding window.
+            e.failures.retain(|&t| now.duration_since(t) < AUTH_FAIL_WINDOW);
+            e.failures.push(now);
+            if e.failures.len() >= AUTH_FAIL_THRESHOLD && e.cooldown_until.is_none() {
+                e.cooldown_until = Some(now + AUTH_FAIL_COOLDOWN);
+                newly_blocked = true;
+            } else {
+                newly_blocked = false;
+            }
+        }
+        if newly_blocked {
+            warn!(
+                "Auth-fail threshold ({} failures / {}s) reached for {} — \
+                 dropping new connections for {}s",
+                AUTH_FAIL_THRESHOLD,
+                AUTH_FAIL_WINDOW.as_secs(),
+                ip,
+                AUTH_FAIL_COOLDOWN.as_secs(),
+            );
+        }
+    }
 }
 
 /// Compute a WebTunnel path auth token for a given time period.
@@ -167,7 +241,8 @@ async fn main() -> anyhow::Result<()> {
     let listener = Arc::new(Obfs4Listener::bind(&listen, config).await?);
     info!("Listening on {} (TLS+obfs4 / WebTunnel / SNI: {})", listen, sni);
 
-    let conn_table: ConnTable = Arc::new(Mutex::new(HashMap::new()));
+    let conn_table:      ConnTable      = Arc::new(Mutex::new(HashMap::new()));
+    let auth_fail_table: AuthFailTable  = AuthFailTable::new();
 
     // Optional secondary listener: bypasses CDN so raw TLS+obfs4 connections can
     // reach the relay directly.  Shares the same obfs4 identity and TLS cert as the
@@ -184,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         let wt_path_alt     = wt_path.clone();
         let bridge_cert_alt = bridge_cert.clone();
         let conn_table_alt  = Arc::clone(&conn_table);
+        let auth_fail_alt   = auth_fail_table.clone();
         let tls_config_alt  = upstream_tls_config.clone();
 
         tokio::spawn(async move {
@@ -191,6 +267,10 @@ async fn main() -> anyhow::Result<()> {
                 match alt_tcp.accept().await {
                     Ok((tcp, peer)) => {
                         let ip = peer.ip();
+                        if auth_fail_alt.is_blocked(ip) {
+                            warn!("Auth-cooldown: dropping connection from {}", ip);
+                            continue;
+                        }
                         let guard = match try_acquire(&conn_table_alt, ip, max_conns_per_ip) {
                             Some(g) => g,
                             None => {
@@ -204,8 +284,9 @@ async fn main() -> anyhow::Result<()> {
                         let wt_path      = wt_path_alt.clone();
                         let bridge_cert  = bridge_cert_alt.clone();
                         let tls_cfg      = tls_config_alt.clone();
+                        let auth_fail    = auth_fail_alt.clone();
                         tokio::spawn(async move {
-                            handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, tls_cfg).await;
+                            handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, tls_cfg, auth_fail).await;
                             drop(guard);
                         });
                     }
@@ -219,6 +300,10 @@ async fn main() -> anyhow::Result<()> {
         match listener.accept_tcp().await {
             Ok((tcp, peer)) => {
                 let ip = peer.ip();
+                if auth_fail_table.is_blocked(ip) {
+                    warn!("Auth-cooldown: dropping connection from {}", ip);
+                    continue;
+                }
                 let guard = match try_acquire(&conn_table, ip, max_conns_per_ip) {
                     Some(g) => g,
                     None => {
@@ -232,8 +317,9 @@ async fn main() -> anyhow::Result<()> {
                 let wt_path          = wt_path.clone();
                 let bridge_cert      = bridge_cert.clone();
                 let upstream_tls_cfg = upstream_tls_config.clone();
+                let auth_fail        = auth_fail_table.clone();
                 tokio::spawn(async move {
-                    handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, upstream_tls_cfg).await;
+                    handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, upstream_tls_cfg, auth_fail).await;
                     drop(guard); // release slot when connection ends
                 });
             }
@@ -251,6 +337,7 @@ async fn handle_conn(
     wt_path: String,
     bridge_cert: String,
     upstream_tls: Option<Arc<rustls::ClientConfig>>,
+    auth_fail: AuthFailTable,
 ) {
     let tls_stream = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, tls_acceptor.accept(tcp)).await {
         Ok(Ok(s))  => s,
@@ -296,6 +383,7 @@ async fn handle_conn(
             // Unknown path: delay then respond as a generic nginx server.
             // The delay makes automated path enumeration ~500× slower.
             // The HTTP response hides the relay from internet scanners (Shodan, Censys).
+            auth_fail.record_failure(peer.ip());
             warn!("WebTunnel auth rejected from {} — sending decoy response", peer);
             tokio::time::sleep(Duration::from_millis(500)).await;
             send_decoy_http_response(&mut buffered).await;
@@ -304,7 +392,10 @@ async fn handle_conn(
         // obfs4 path: existing encrypted transport
         match obfs4_listener.accept_stream(buffered).await {
             Ok(s)  => relay_conn(s, peer, upstream, upstream_tls).await,
-            Err(e) => warn!("obfs4 handshake failed from {}: {}", peer, e),
+            Err(e) => {
+                auth_fail.record_failure(peer.ip());
+                warn!("obfs4 handshake failed from {}: {}", peer, e);
+            }
         }
     }
 }
