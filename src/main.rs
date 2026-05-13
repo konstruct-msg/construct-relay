@@ -29,12 +29,12 @@ const AUTH_PERIOD_SECS:    u64    = 300;
 /// single legitimate client can hold 6–12 simultaneous connections.  Set conservatively
 /// high enough to not rate-limit real clients while still blocking floods.
 const DEFAULT_MAX_CONNS_PER_IP: usize = 24;
-/// Auth failures within this window count toward the threshold.
-const AUTH_FAIL_WINDOW:     Duration = Duration::from_secs(3_600); // 1 hour
-/// Failures within AUTH_FAIL_WINDOW needed to enter cooldown.
-const AUTH_FAIL_THRESHOLD:  usize    = 5;
-/// How long a blocked IP stays in cooldown before being retried.
-const AUTH_FAIL_COOLDOWN:   Duration = Duration::from_secs(3_600); // 1 hour
+/// Number of auth failures before an IP enters cooldown.
+/// Uses a simple cumulative counter (no sliding window) so slow persistent
+/// probers (e.g. one attempt per hour) are caught after exactly N tries.
+const AUTH_FAIL_THRESHOLD:  usize    = 3;
+/// How long a blocked IP stays in cooldown. Counter resets on expiry.
+const AUTH_FAIL_COOLDOWN:   Duration = Duration::from_secs(86_400); // 24 hours
 
 // ---------------------------------------------------------------------------
 // Per-IP connection limiter (RAII guard)
@@ -75,14 +75,16 @@ fn try_acquire(table: &ConnTable, ip: IpAddr, max: usize) -> Option<ConnGuard> {
 // ---------------------------------------------------------------------------
 //
 // Tracks WebTunnel bad-path rejections and obfs4 HMAC failures per source IP.
-// After AUTH_FAIL_THRESHOLD failures within AUTH_FAIL_WINDOW the IP enters a
-// cooldown: incoming TCP connections are dropped immediately (before TLS),
-// saving CPU on obfs4 key derivation and WebSocket parsing.
+// Uses a simple cumulative counter (not a sliding window) so slow persistent
+// probers that stay under the per-hour rate are still caught after N total tries.
+// After AUTH_FAIL_THRESHOLD failures the IP enters AUTH_FAIL_COOLDOWN: incoming
+// TCP connections are dropped immediately (before TLS), saving CPU on obfs4
+// key derivation and WebSocket parsing. Counter resets when the cooldown expires.
 
 #[derive(Default)]
 struct FailEntry {
-    /// Timestamps of recent auth failures (pruned to AUTH_FAIL_WINDOW).
-    failures:       Vec<Instant>,
+    /// Cumulative auth failure count since the entry was created / last reset.
+    count:          usize,
     /// If Some, the IP is blocked until this instant.
     cooldown_until: Option<Instant>,
 }
@@ -102,7 +104,7 @@ impl AuthFailTable {
                 if now < until {
                     return true;
                 }
-                map.remove(&ip); // cooldown expired — clean up
+                map.remove(&ip); // cooldown expired — reset counter
             }
         }
         false
@@ -115,10 +117,8 @@ impl AuthFailTable {
             let mut map = self.0.lock().unwrap();
             let now = Instant::now();
             let e = map.entry(ip).or_default();
-            // Drop failures older than the sliding window.
-            e.failures.retain(|&t| now.duration_since(t) < AUTH_FAIL_WINDOW);
-            e.failures.push(now);
-            if e.failures.len() >= AUTH_FAIL_THRESHOLD && e.cooldown_until.is_none() {
+            e.count += 1;
+            if e.count >= AUTH_FAIL_THRESHOLD && e.cooldown_until.is_none() {
                 e.cooldown_until = Some(now + AUTH_FAIL_COOLDOWN);
                 newly_blocked = true;
             } else {
@@ -127,12 +127,11 @@ impl AuthFailTable {
         }
         if newly_blocked {
             warn!(
-                "Auth-fail threshold ({} failures / {}s) reached for {} — \
-                 dropping new connections for {}s",
+                "Auth-fail threshold ({} failures) reached for {} — \
+                 dropping new connections for {}h",
                 AUTH_FAIL_THRESHOLD,
-                AUTH_FAIL_WINDOW.as_secs(),
                 ip,
-                AUTH_FAIL_COOLDOWN.as_secs(),
+                AUTH_FAIL_COOLDOWN.as_secs() / 3600,
             );
         }
     }
