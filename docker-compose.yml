@@ -19,6 +19,9 @@ services:
       WT_PATH: ${WT_PATH:-}
       # Alt obfs4 listener inside container (mapped to ALT_LISTEN_PORT on host).
       ALT_LISTEN_ADDR: ${ALT_LISTEN_ADDR:-0.0.0.0:9894}
+      # Trusted proxy CIDRs: exempt from auth-fail rate-limiting and per-IP conn limits.
+      # Set to the Docker bridge range so nginx-proxied clients are never wrongly banned.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}
     restart: unless-stopped
     logging:
       driver: "json-file"

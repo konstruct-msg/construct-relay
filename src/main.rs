@@ -140,6 +140,61 @@ impl AuthFailTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Trusted proxy IP ranges (TRUSTED_PROXIES env var)
+// ---------------------------------------------------------------------------
+//
+// When the relay runs behind a local L4 proxy (e.g. nginx stream block, Docker
+// network bridge), all TCP connections appear to originate from the proxy's IP
+// (typically 172.18.0.1 on a Docker bridge network). Rate-limit and per-IP
+// conn tracking by source IP is useless in this case and actively harmful —
+// a single failed auth attempt from any real client can trigger a 24 h ban
+// that blocks ALL subsequent clients going through the same proxy IP.
+//
+// Set TRUSTED_PROXIES to a comma-separated list of IPs or CIDRs that should
+// be exempt from auth-fail rate-limiting and per-IP connection limits.
+// Example: TRUSTED_PROXIES=172.16.0.0/12  (all private Docker bridge ranges)
+
+fn parse_trusted_proxies(raw: &str) -> Vec<(IpAddr, u8)> {
+    raw.split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() { return None; }
+            if let Some((ip_part, prefix_part)) = s.split_once('/') {
+                let ip: IpAddr = ip_part.trim().parse().ok()?;
+                let prefix: u8 = prefix_part.trim().parse().ok()?;
+                Some((ip, prefix))
+            } else {
+                let ip: IpAddr = s.parse().ok()?;
+                let prefix = match ip { IpAddr::V4(_) => 32, IpAddr::V6(_) => 128 };
+                Some((ip, prefix))
+            }
+        })
+        .collect()
+}
+
+fn ip_in_cidr(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
+    match (ip, net) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => {
+            if prefix == 0 { return true; }
+            if prefix >= 32 { return ip == net; }
+            let mask = !0u32 << (32 - prefix);
+            (u32::from(ip) & mask) == (u32::from(net) & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) => {
+            if prefix == 0 { return true; }
+            if prefix >= 128 { return ip == net; }
+            let mask = !0u128 << (128 - prefix);
+            (u128::from(ip) & mask) == (u128::from(net) & mask)
+        }
+        _ => false,
+    }
+}
+
+fn is_trusted_proxy(ip: IpAddr, proxies: &[(IpAddr, u8)]) -> bool {
+    proxies.iter().any(|&(net, prefix)| ip_in_cidr(ip, net, prefix))
+}
+
 /// Compute a WebTunnel path auth token for a given time period.
 ///
 /// Both the relay and the iOS client derive the token identically:
@@ -202,6 +257,12 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_CONNS_PER_IP);
+    let trusted_proxies: Arc<Vec<(IpAddr, u8)>> = Arc::new(
+        std::env::var("TRUSTED_PROXIES")
+            .ok()
+            .map(|v| parse_trusted_proxies(&v))
+            .unwrap_or_default(),
+    );
 
     // Build upstream TLS config once (reused for every connection).
     let upstream_tls_config = if upstream_tls {
@@ -229,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
     info!("║  TLS SNI   {}", sni);
     info!("║  wt_path   {}/{} (WebTunnel v2, current token)", wt_path, webtunnel_token(&bridge_cert, now_period));
     info!("║  max_conns {}/IP", max_conns_per_ip);
+    if !trusted_proxies.is_empty() {
+        info!("║  trusted_proxies: {} range(s) (auth-fail + conn limits bypassed)", trusted_proxies.len());
+    }
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  obfs4 bridge cert:");
     info!("║    {}", bridge_cert);
@@ -263,21 +327,27 @@ async fn main() -> anyhow::Result<()> {
         let conn_table_alt  = Arc::clone(&conn_table);
         let auth_fail_alt   = auth_fail_table.clone();
         let tls_config_alt  = upstream_tls_config.clone();
+        let proxies_alt     = Arc::clone(&trusted_proxies);
 
         tokio::spawn(async move {
             loop {
                 match alt_tcp.accept().await {
                     Ok((tcp, peer)) => {
                         let ip = peer.ip();
-                        if auth_fail_alt.is_blocked(ip) {
+                        let trusted = is_trusted_proxy(ip, &proxies_alt);
+                        if !trusted && auth_fail_alt.is_blocked(ip) {
                             warn!("Auth-cooldown: dropping connection from {}", ip);
                             continue;
                         }
-                        let guard = match try_acquire(&conn_table_alt, ip, max_conns_per_ip) {
-                            Some(g) => g,
-                            None => {
-                                warn!("Alt connection limit ({}) exceeded for {} — dropping", max_conns_per_ip, ip);
-                                continue;
+                        let guard: Option<ConnGuard> = if trusted {
+                            None
+                        } else {
+                            match try_acquire(&conn_table_alt, ip, max_conns_per_ip) {
+                                Some(g) => Some(g),
+                                None => {
+                                    warn!("Alt connection limit ({}) exceeded for {} — dropping", max_conns_per_ip, ip);
+                                    continue;
+                                }
                             }
                         };
                         let acceptor     = tls_alt.clone();
@@ -287,8 +357,9 @@ async fn main() -> anyhow::Result<()> {
                         let bridge_cert  = bridge_cert_alt.clone();
                         let tls_cfg      = tls_config_alt.clone();
                         let auth_fail    = auth_fail_alt.clone();
+                        let proxies      = Arc::clone(&proxies_alt);
                         tokio::spawn(async move {
-                            handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, tls_cfg, auth_fail).await;
+                            handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, tls_cfg, auth_fail, proxies).await;
                             drop(guard);
                         });
                     }
@@ -302,15 +373,20 @@ async fn main() -> anyhow::Result<()> {
         match listener.accept_tcp().await {
             Ok((tcp, peer)) => {
                 let ip = peer.ip();
-                if auth_fail_table.is_blocked(ip) {
+                let trusted = is_trusted_proxy(ip, &trusted_proxies);
+                if !trusted && auth_fail_table.is_blocked(ip) {
                     warn!("Auth-cooldown: dropping connection from {}", ip);
                     continue;
                 }
-                let guard = match try_acquire(&conn_table, ip, max_conns_per_ip) {
-                    Some(g) => g,
-                    None => {
-                        warn!("Connection limit ({}) exceeded for {} — dropping", max_conns_per_ip, ip);
-                        continue;
+                let guard: Option<ConnGuard> = if trusted {
+                    None
+                } else {
+                    match try_acquire(&conn_table, ip, max_conns_per_ip) {
+                        Some(g) => Some(g),
+                        None => {
+                            warn!("Connection limit ({}) exceeded for {} — dropping", max_conns_per_ip, ip);
+                            continue;
+                        }
                     }
                 };
                 let acceptor         = relay_tls.acceptor.clone();
@@ -320,8 +396,9 @@ async fn main() -> anyhow::Result<()> {
                 let bridge_cert      = bridge_cert.clone();
                 let upstream_tls_cfg = upstream_tls_config.clone();
                 let auth_fail        = auth_fail_table.clone();
+                let proxies          = Arc::clone(&trusted_proxies);
                 tokio::spawn(async move {
-                    handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, upstream_tls_cfg, auth_fail).await;
+                    handle_conn(tcp, peer, acceptor, listener2, upstream, wt_path, bridge_cert, upstream_tls_cfg, auth_fail, proxies).await;
                     drop(guard); // release slot when connection ends
                 });
             }
@@ -340,6 +417,7 @@ async fn handle_conn(
     bridge_cert: String,
     upstream_tls: Option<Arc<rustls::ClientConfig>>,
     auth_fail: AuthFailTable,
+    trusted_proxies: Arc<Vec<(IpAddr, u8)>>,
 ) {
     let tls_stream = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, tls_acceptor.accept(tcp)).await {
         Ok(Ok(s))  => s,
@@ -385,7 +463,9 @@ async fn handle_conn(
             // Unknown path: delay then respond as a generic nginx server.
             // The delay makes automated path enumeration ~500× slower.
             // The HTTP response hides the relay from internet scanners (Shodan, Censys).
-            auth_fail.record_failure(peer.ip());
+            if !is_trusted_proxy(peer.ip(), &trusted_proxies) {
+                auth_fail.record_failure(peer.ip());
+            }
             warn!("WebTunnel auth rejected from {} — sending decoy response", peer);
             tokio::time::sleep(Duration::from_millis(500)).await;
             send_decoy_http_response(&mut buffered).await;
@@ -395,7 +475,9 @@ async fn handle_conn(
         match obfs4_listener.accept_stream(buffered).await {
             Ok(s)  => relay_conn(s, peer, upstream, upstream_tls).await,
             Err(e) => {
-                auth_fail.record_failure(peer.ip());
+                if !is_trusted_proxy(peer.ip(), &trusted_proxies) {
+                    auth_fail.record_failure(peer.ip());
+                }
                 warn!("obfs4 handshake failed from {}: {}", peer, e);
             }
         }
