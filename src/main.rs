@@ -15,7 +15,10 @@ use tracing::{error, info, warn};
 const DEFAULT_LISTEN:      &str = "0.0.0.0:443";
 const DEFAULT_STATE:       &str = "/data";
 const DEFAULT_SNI:         &str = "storage.yandexcloud.net";
-const DEFAULT_WT_PATH:     &str = "/construct-ice";
+/// Neutral WebSocket path that looks like a generic API endpoint.
+/// Override with WT_PATH env var on the relay.  Avoid service-identifying
+/// names — this path appears in HTTP Upgrade requests and is DPI-visible.
+const DEFAULT_WT_PATH:     &str = "/api/stream";
 /// Secondary listener port for direct TLS+obfs4 connections that bypass CDN.
 /// Set ALT_LISTEN_ADDR=0.0.0.0:9443 on CDN-fronted relays (e.g. MSK/Yandex Cloud)
 /// so mobile clients can reach the relay without going through the CDN layer.
