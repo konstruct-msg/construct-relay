@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "signed_at": 1778958082,
+  "signed_at": 1779004677,
   "bundle_signing_key": "kDGyaafEFExKTdB7MJXl4xYf0pFnxEg7bZJh7BDP9LI=",
   "ice": {
     "relays": [
@@ -27,7 +27,10 @@
         "wt_host_header": "api.divany-kresla.uk",
         "region": "RU"
       }
+    ],
+    "deprecated_ids": [
+      "spb-mt-1"
     ]
   },
-  "signature": "ed25519:bmZW6fP5qr5v9xxPUMxSP1m8bqRaw9oxXisopBA7DJ4g6JWskl6bAouHEQQB7fa4Q6b3sSq3gq5RVs7TpmSsDg"
+  "signature": "ed25519:6PZmqeQmUrsozYE1hAPwvx9urxh_cY_e1Ou1-3vbmmJfYN2RAZqjAnfho5a_oycc6E59v2UED7_vCpfxlirKDQ"
 }
