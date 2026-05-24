@@ -2,10 +2,14 @@ services:
   relay:
     image: ghcr.io/maximeliseyev/construct-relay:latest
     ports:
-      # Primary listener: container :443 → host :443 (or LISTEN_PORT override)
-      - "${LISTEN_PORT:-443}:443"
-      # Alt listener: direct obfs4 bypass (no CDN). Container binds :9894 internally,
-      # mapped to ALT_LISTEN_PORT on the host (default: 52143).
+      # Primary listener.
+      # Simple deployment (no nginx): "${LISTEN_PORT:-9894}:443"
+      # Behind nginx cover site:      "127.0.0.1:${LISTEN_PORT:-8443}:443"
+      #   nginx (deploy/nginx-ru-vps.conf) proxies port 443 → 127.0.0.1:8443
+      #   Container :443 is mapped to the loopback address only.
+      - "${LISTEN_PORT:-9894}:443"
+      # Alt listener: direct obfs4 bypass (CDN or nginx bypass).
+      # Container binds :9894 internally, exposed on ALT_LISTEN_PORT on the host.
       - "${ALT_LISTEN_PORT:-52143}:9894"
     volumes:
       - relay_data:/data
@@ -13,14 +17,19 @@ services:
       UPSTREAM: ${UPSTREAM}
       UPSTREAM_TLS: ${UPSTREAM_TLS:-true}
       STATE_DIR: /data
-      # TLS SNI: pick a domain plausible for the VPS host's network range.
+      # TLS SNI: pick a domain plausible for the VPS host network range.
+      # Simple:          fra1.digitaloceanspaces.com
+      # RU VPS (behind nginx cover site): storage.yandexcloud.net
       TLS_SNI_HOST: ${TLS_SNI_HOST:-fra1.digitaloceanspaces.com}
-      # WebTunnel: enable only with real CDN fronting (bare IP triggers active probing).
+      # WebTunnel path.
+      # Leave empty for bare-IP deployments (triggers DPI active probing).
+      # Set to e.g. /api/stream when behind nginx cover site or CDN.
       WT_PATH: ${WT_PATH:-}
-      # Alt obfs4 listener inside container (mapped to ALT_LISTEN_PORT on host).
+      # Alt obfs4 listener address inside the container.
       ALT_LISTEN_ADDR: ${ALT_LISTEN_ADDR:-0.0.0.0:9894}
-      # Trusted proxy CIDRs: exempt from auth-fail rate-limiting and per-IP conn limits.
-      # Set to the Docker bridge range so nginx-proxied clients are never wrongly banned.
+      # Trusted proxy CIDRs: bypass auth-fail rate-limiting and per-IP conn limits.
+      # Always include the Docker bridge range (172.16.0.0/12) when the relay is
+      # behind nginx so connections from the bridge gateway are never wrongly banned.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}
     restart: unless-stopped
     logging:

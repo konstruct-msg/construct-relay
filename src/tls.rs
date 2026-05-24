@@ -25,10 +25,8 @@ pub fn setup(state_dir: &str, sni: &str) -> anyhow::Result<RelayTls> {
             .with_context(|| format!("creating state dir {state_dir}"))?;
         info!("Generating self-signed TLS cert for SNI: {sni}");
         let (c, k) = generate_cert(sni)?;
-        std::fs::write(&cert_path, &c)
-            .with_context(|| format!("writing {cert_path}"))?;
-        std::fs::write(&key_path, &k)
-            .with_context(|| format!("writing {key_path}"))?;
+        std::fs::write(&cert_path, &c).with_context(|| format!("writing {cert_path}"))?;
+        std::fs::write(&key_path, &k).with_context(|| format!("writing {key_path}"))?;
         (c, k)
     };
 
@@ -55,10 +53,12 @@ pub fn setup(state_dir: &str, sni: &str) -> anyhow::Result<RelayTls> {
 
 fn generate_cert(sni: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let kp = rcgen::KeyPair::generate().context("generating key pair")?;
-    let mut params = rcgen::CertificateParams::new(vec![sni.to_string()])
-        .context("building cert params")?;
+    let mut params =
+        rcgen::CertificateParams::new(vec![sni.to_string()]).context("building cert params")?;
     params.distinguished_name = rcgen::DistinguishedName::new();
-    params.distinguished_name.push(rcgen::DnType::CommonName, sni);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, sni);
     let cert = params.self_signed(&kp).context("self-signing cert")?;
     Ok((cert.der().to_vec(), kp.serialize_der()))
 }

@@ -108,13 +108,127 @@ In `construct-server/tools/`:
 
 ---
 
-## Do NOT enable WebTunnel on bare IPs
+## Behind nginx with Apple CDN anti-probe (RU VPS)
 
-WebTunnel (WebSocket-over-TLS) triggers DPI active probing. The prober sees a WebSocket upgrade response → identifies it as a proxy → **IP gets blocked within hours**.
+For high-risk deployments (Russia, Kazakhstan, etc.) run the relay behind nginx with
+SNI-based routing. The key insight: **all non-relay traffic is forwarded to Apple CDN**,
+making the IP look like a CDN node — not a proxy.
 
-Enable WebTunnel **only** after placing a real CDN (Cloudflare Workers, etc.) in front of the relay so TLS terminates at the CDN node, not at your VPS IP.
+### Why the naive nginx setup breaks obfs4
 
-Leave `WT_PATH=` empty in `.env` (the default).
+A standard `proxy_pass` config (L7 HTTP proxy) terminates TLS and then sees binary
+obfs4 bytes — which nginx can't route → 404. WebTunnel worked only because it is a
+valid HTTP WebSocket upgrade that nginx could proxy.
+
+### Fix: SNI-based TCP passthrough with Apple CDN default
+
+nginx reads the TLS SNI from the ClientHello **without terminating TLS** and routes:
+
+```
+Port 443 inbound
+  SNI = api.divany-kresla.uk  →  construct-relay (port 8443, handles own TLS)
+  SNI = anything else         →  Apple CDN 17.253.144.10:443
+         ↑ scanners, RKN, bare IP probes — they see Apple's certificate
+```
+
+Relay clients use `api.divany-kresla.uk` as SNI. Everything else looks like Apple
+CDN traffic. The IP is too risky to block (Apple is not blocked in Russia).
+
+### Setup steps
+
+**1. nginx stream module** — `stream {}` блок требует отдельного модуля.
+
+```bash
+# Проверить, есть ли модуль:
+nginx -V 2>&1 | grep stream_ssl_preread_module   # должно что-то напечатать
+
+# Если нет — установить (Ubuntu/Debian):
+apt install libnginx-mod-stream
+
+# Если модуль стоит, но nginx.conf его не видит — добавить ПЕРЕД events{}:
+# load_module modules/ngx_stream_module.so;
+```
+
+> **Альтернатива без stream-модуля: HAProxy** (`deploy/haproxy-ru-vps.cfg`)  
+> `apt install haproxy` — умеет SNI-роутинг из коробки, без доп. модулей.  
+> nginx оставляете только на порту 80 (HTTP cover site).
+
+**Важно:** блок `stream {}` должен быть на **верхнем уровне** `/etc/nginx/nginx.conf`,
+а не внутри `http {}`. Если вы используете include conf.d/*.conf — этот include обычно
+находится внутри `http {}`, туда `stream {}` класть нельзя. Добавляйте `stream {}`
+напрямую в nginx.conf вне `http {}`.
+
+```
+# /etc/nginx/nginx.conf (структура):
+events { ... }
+stream { ... }   ← здесь, снаружи http
+http {
+    include /etc/nginx/conf.d/*.conf;   ← conf.d идёт сюда, stream туда нельзя
+}
+```
+
+**2. Cover site** HTML in `/var/www/divany-kresla/` (served on port 80 via HTTP).
+
+**3. Relay `.env`**:
+```
+LISTEN_PORT=127.0.0.1:8443        # loopback only — nginx proxies port 443
+TLS_SNI_HOST=api.divany-kresla.uk # MUST match the SNI nginx routes on
+WT_PATH=/api/stream               # WebTunnel OK here
+TRUSTED_PROXIES=172.16.0.0/12    # Docker bridge (already the default)
+```
+
+> **Important:** `TLS_SNI_HOST` must match the SNI clients send (`api.divany-kresla.uk`).
+> The relay generates a self-signed cert for this name; iOS clients verify by SPKI
+> fingerprint only — hostname mismatch is not an error.
+
+**4. Firewall** — block direct access to port 8443 from the internet:
+```bash
+ufw deny 8443/tcp
+ufw allow 443/tcp
+ufw allow 80/tcp
+```
+
+**5. Start** relay and reload nginx:
+```bash
+docker compose up -d
+nginx -t && systemctl reload nginx
+```
+
+**6. Update `relays.json`** — use port 443 and the relay SNI subdomain:
+```json
+{
+  "addr":        "<VPS_IP>",
+  "port":        443,
+  "sni":         "api.divany-kresla.uk",
+  "wt_path":     "/api/stream",
+  "spki_sha256": "<SPKI_HEX from docker logs>",
+  "bridge_cert": "<BRIDGE_CERT from docker logs>"
+}
+```
+Add a second entry for the alt-listener (port 52143) as a direct obfs4 fallback
+that bypasses nginx.
+
+### Why Apple CDN and not a fake site on port 443
+
+Serving a local cover site on port 443 requires a valid TLS cert for the domain, which
+anchors the IP to that domain and makes DPI fingerprinting easier. Forwarding to Apple CDN:
+- Presents Apple's valid cert to scanners (no fingerprinting gap)
+- Makes the IP appear as an Apple CDN/Akamai node
+- Apple IPs are categorically safe from RKN blocking
+
+---
+
+## Do NOT enable WebTunnel on bare IPs (without nginx)
+
+WebTunnel (WebSocket-over-TLS) triggers DPI active probing on bare IP deployments.
+The prober sees a WebSocket upgrade response → identifies it as a proxy → **IP blocked
+within hours**.
+
+Enable WebTunnel **only** when the relay is behind nginx (cover site setup above) or
+a real CDN (Cloudflare Workers, etc.) so TLS terminates somewhere other than the raw
+relay IP.
+
+Leave `WT_PATH=` empty in `.env` for the simple bare-IP deployment.
 
 ---
 

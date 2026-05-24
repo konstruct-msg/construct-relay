@@ -1,6 +1,6 @@
 [package]
 name = "construct-relay"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2024"
 description = "One-command relay for Construct messenger — deploys in minutes, no TLS certs or nginx required"
 license = "MIT"
@@ -10,7 +10,7 @@ name = "construct-relay"
 path = "src/main.rs"
 
 [dependencies]
-construct-ice = { git = "https://github.com/maximeliseyev/construct-ice", features = ["webtunnel", "server"] }
+construct-ice = { git = "https://github.com/naminohi/construct-ice", features = ["webtunnel", "server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
