@@ -1,6 +1,6 @@
 services:
   relay:
-    image: ghcr.io/naminohi/construct-relay:latest
+    image: ghcr.io/konstruct-msg/construct-relay:latest
     ports:
       # Primary listener.
       # Simple deployment (no nginx): "${LISTEN_PORT:-9894}:443"

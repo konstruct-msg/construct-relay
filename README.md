@@ -1,6 +1,6 @@
 # construct-relay
 
-One-command obfs4 relay for [Construct messenger](https://github.com/maximeliseyev/construct-messenger).
+One-command obfs4 relay for [Construct messenger](https://github.com/konstruct-msg/construct-messenger).
 
 Forwards gRPC traffic through the `construct-ice` obfs4 transport — no TLS certificates or nginx required.
 
@@ -23,7 +23,7 @@ Active-probing resistance built in: TLS/HTTP probes are silently forwarded to a 
 ### 1 — Clone and configure
 
 ```bash
-git clone https://github.com/maximeliseyev/construct-relay
+git clone https://github.com/konstruct-msg/construct-relay
 cd construct-relay
 cp .env.example .env
 nano .env   # set UPSTREAM to your construct-server address
