@@ -10,7 +10,7 @@ name = "construct-relay"
 path = "src/main.rs"
 
 [dependencies]
-construct-ice = { git = "https://github.com/naminohi/construct-ice", features = ["webtunnel", "server"] }
+construct-ice = { git = "https://github.com/konstruct-msg/construct-ice", features = ["webtunnel", "server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
@@ -20,11 +20,12 @@ x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
 anyhow = "1"
+socket2 = { version = "0.5", features = ["all"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Uncomment for local development against a checked-out construct-ice:
-# [patch."https://github.com/maximeliseyev/construct-ice"]
+# [patch."https://github.com/konstruct-msg/construct-ice"]
 # construct-ice = { path = "../construct-ice" }
 
 [profile.release]

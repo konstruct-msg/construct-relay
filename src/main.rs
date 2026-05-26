@@ -12,6 +12,30 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
+/// Set TCP keepalive on `stream` so OS-level probes prevent NAT/HAProxy from
+/// treating the connection as idle during silent gRPC periods.
+///
+/// Uses 15 s idle delay + 5 s probe interval so the first keepalive probe fires
+/// well before HAProxy's configured timeout.  SAFETY: the raw fd is only borrowed
+/// for the setsockopt call; `mem::forget` prevents socket2 from closing it.
+#[cfg(unix)]
+fn apply_tcp_keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(15))
+        .with_interval(Duration::from_secs(5));
+    #[cfg(target_os = "linux")]
+    let ka = ka.with_retries(3);
+    // SAFETY: fd is valid and still owned by `stream`. We forget the Socket so
+    // socket2's Drop impl doesn't close the same fd a second time.
+    use std::os::fd::FromRawFd;
+    let socket = unsafe { socket2::Socket::from_raw_fd(stream.as_raw_fd()) };
+    if let Err(e) = socket.set_tcp_keepalive(&ka) {
+        warn!("set_tcp_keepalive failed: {}", e);
+    }
+    std::mem::forget(socket);
+}
+
 const DEFAULT_LISTEN: &str = "0.0.0.0:443";
 const DEFAULT_STATE: &str = "/data";
 const DEFAULT_SNI: &str = "storage.yandexcloud.net";
@@ -375,6 +399,8 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 match alt_tcp.accept().await {
                     Ok((tcp, peer)) => {
+                        #[cfg(unix)]
+                        apply_tcp_keepalive(&tcp);
                         let ip = peer.ip();
                         let trusted = is_trusted_proxy(ip, &proxies_alt);
                         if !trusted && auth_fail_alt.is_blocked(ip) {
@@ -429,6 +455,8 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match listener.accept_tcp().await {
             Ok((tcp, peer)) => {
+                #[cfg(unix)]
+                apply_tcp_keepalive(&tcp);
                 let ip = peer.ip();
                 let trusted = is_trusted_proxy(ip, &trusted_proxies);
                 if !trusted && auth_fail_table.is_blocked(ip) {
@@ -637,6 +665,8 @@ async fn relay_conn<S: AsyncRead + AsyncWrite + Unpin>(
             return;
         }
     };
+    #[cfg(unix)]
+    apply_tcp_keepalive(&tcp);
 
     if let Some(tls_config) = upstream_tls {
         // Re-encrypt to upstream with TLS (required when UPSTREAM is a TLS port).

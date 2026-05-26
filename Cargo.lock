@@ -129,7 +129,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 [[package]]
 name = "construct-ice"
 version = "2.3.2"
-source = "git+https://github.com/naminohi/construct-ice#cf91b651c7dc5adb895ab063c72551492acd22c0"
+source = "git+https://github.com/konstruct-msg/construct-ice#bd97e00d7c6efb67659c9b4fa6a70b76f57884ab"
 dependencies = [
  "base64",
  "bytes",
@@ -164,6 +164,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "sha2",
+ "socket2 0.5.10",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -812,6 +813,16 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
@@ -927,7 +938,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
