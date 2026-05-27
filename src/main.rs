@@ -41,14 +41,23 @@ async fn spawn_handler(tcp: TcpStream, peer: SocketAddr, ctx: &SpawnCtx) {
     #[cfg(unix)]
     apply_tcp_keepalive(&tcp);
     let ip = peer.ip();
-    debug!("[{label}] TCP accept from {peer}", label = ctx.handler.label);
+    debug!(
+        "[{label}] TCP accept from {peer}",
+        label = ctx.handler.label
+    );
 
     let trusted = is_trusted_proxy(ip, &ctx.trusted_proxies);
     if trusted {
-        debug!("[{label}] {ip} is trusted proxy — bypassing rate limits", label = ctx.handler.label);
+        debug!(
+            "[{label}] {ip} is trusted proxy — bypassing rate limits",
+            label = ctx.handler.label
+        );
     }
     if !trusted && ctx.auth_fail.is_blocked(ip) {
-        warn!("[{label}] Auth-cooldown: dropping connection from {ip}", label = ctx.handler.label);
+        warn!(
+            "[{label}] Auth-cooldown: dropping connection from {ip}",
+            label = ctx.handler.label
+        );
         return;
     }
     let guard: Option<ConnGuard> = if trusted {

@@ -56,11 +56,17 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
         match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, ctx.tls_acceptor.accept(tcp)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                warn!("[{label}] TLS handshake failed from {peer}: {e}", label = ctx.label);
+                warn!(
+                    "[{label}] TLS handshake failed from {peer}: {e}",
+                    label = ctx.label
+                );
                 return;
             }
             Err(_) => {
-                warn!("[{label}] TLS handshake timed out from {peer}", label = ctx.label);
+                warn!(
+                    "[{label}] TLS handshake timed out from {peer}",
+                    label = ctx.label
+                );
                 return;
             }
         };
@@ -82,7 +88,10 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
     if first == b'G' {
         // WebTunnel path: validate time-based auth token derived from bridge cert,
         // then perform WebSocket handshake and relay.
-        info!("WebTunnel connection from {peer} ({label})", label = ctx.label);
+        info!(
+            "WebTunnel connection from {peer} ({label})",
+            label = ctx.label
+        );
         let valid_paths = ctx.wt_cache.get();
 
         // Peek at the HTTP request path without consuming the buffer.
@@ -90,10 +99,7 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
             use tokio::io::AsyncBufReadExt;
             match buffered.fill_buf().await {
                 Ok(buf) => match extract_http_path(buf) {
-                    Some(p) => (
-                        valid_paths.iter().any(|v| v == p),
-                        Some(p.to_string()),
-                    ),
+                    Some(p) => (valid_paths.iter().any(|v| v == p), Some(p.to_string())),
                     None => (false, None),
                 },
                 Err(_) => (false, None),
@@ -123,9 +129,7 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
             if !is_trusted_proxy(peer.ip(), &ctx.trusted_proxies) {
                 ctx.auth_fail.record_failure(peer.ip());
             }
-            warn!(
-                "WebTunnel auth rejected from {peer} — sending decoy response"
-            );
+            warn!("WebTunnel auth rejected from {peer} — sending decoy response");
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             send_decoy_http_response(&mut buffered).await;
         }
@@ -259,9 +263,7 @@ where
         tokio::io::copy(&mut br, &mut aw),
     ) {
         Ok((c2s, s2c)) => {
-            info!(
-                "Relay {peer} → {upstream} closed (c2s={c2s}B, s2c={s2c}B)"
-            );
+            info!("Relay {peer} → {upstream} closed (c2s={c2s}B, s2c={s2c}B)");
         }
         Err(e) if is_routine_disconnect(&e) => {
             info!("Relay {peer} → {upstream} disconnected ({e})");

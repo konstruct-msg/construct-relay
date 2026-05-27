@@ -104,7 +104,10 @@ impl AuthFailTable {
         });
         let removed = before.saturating_sub(map.len());
         if removed > 0 {
-            debug!("AuthFailTable cleanup: removed {removed} entries (remaining: {})", map.len());
+            debug!(
+                "AuthFailTable cleanup: removed {removed} entries (remaining: {})",
+                map.len()
+            );
         }
     }
 
@@ -128,11 +131,16 @@ impl AuthFailTable {
         if let Some(e) = map.get_mut(&ip) {
             if let Some(until) = e.cooldown_until {
                 if now < until {
-                    debug!("AuthFailTable: {ip} is blocked (cooldown expires in {}s)",
-                        (until - now).as_secs());
+                    debug!(
+                        "AuthFailTable: {ip} is blocked (cooldown expires in {}s)",
+                        (until - now).as_secs()
+                    );
                     return true;
                 }
-                debug!("AuthFailTable: {ip} cooldown expired — resetting counter (was {} failures)", e.count);
+                debug!(
+                    "AuthFailTable: {ip} cooldown expired — resetting counter (was {} failures)",
+                    e.count
+                );
                 map.remove(&ip); // cooldown expired — reset counter
             }
         }
@@ -157,7 +165,10 @@ impl AuthFailTable {
                 newly_blocked = false;
             }
             if !newly_blocked {
-                debug!("AuthFailTable: {ip} failure #{count} (threshold: {AUTH_FAIL_THRESHOLD})", count = e.count);
+                debug!(
+                    "AuthFailTable: {ip} failure #{count} (threshold: {AUTH_FAIL_THRESHOLD})",
+                    count = e.count
+                );
             }
         }
         if newly_blocked {
