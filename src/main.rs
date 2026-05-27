@@ -14,11 +14,12 @@ use anyhow::Context;
 use construct_ice::Obfs4Listener;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{
-    DEFAULT_ALT_LISTEN, DEFAULT_LISTEN, DEFAULT_MAX_CONNS_PER_IP, DEFAULT_SNI, DEFAULT_STATE,
-    DEFAULT_WT_PATH, MAX_GLOBAL_CONNECTIONS, is_trusted_proxy,
+    AUTH_FAIL_CLEANUP_INTERVAL, DEFAULT_ALT_LISTEN, DEFAULT_LISTEN, DEFAULT_MAX_CONNS_PER_IP,
+    DEFAULT_SNI, DEFAULT_STATE, DEFAULT_WT_PATH, MAX_GLOBAL_CONNECTIONS, WT_TOKEN_REFRESH_INTERVAL,
+    is_trusted_proxy,
 };
 use crate::conn::{HandlerCtx, apply_tcp_keepalive, handle_incoming};
 use crate::ratelimit::{AuthFailTable, ConnGuard, ConnTable, try_acquire};
@@ -40,9 +41,14 @@ async fn spawn_handler(tcp: TcpStream, peer: SocketAddr, ctx: &SpawnCtx) {
     #[cfg(unix)]
     apply_tcp_keepalive(&tcp);
     let ip = peer.ip();
+    debug!("[{label}] TCP accept from {peer}", label = ctx.handler.label);
+
     let trusted = is_trusted_proxy(ip, &ctx.trusted_proxies);
+    if trusted {
+        debug!("[{label}] {ip} is trusted proxy — bypassing rate limits", label = ctx.handler.label);
+    }
     if !trusted && ctx.auth_fail.is_blocked(ip) {
-        warn!("Auth-cooldown: dropping connection from {ip}");
+        warn!("[{label}] Auth-cooldown: dropping connection from {ip}", label = ctx.handler.label);
         return;
     }
     let guard: Option<ConnGuard> = if trusted {
@@ -52,8 +58,9 @@ async fn spawn_handler(tcp: TcpStream, peer: SocketAddr, ctx: &SpawnCtx) {
             Some(g) => Some(g),
             None => {
                 warn!(
-                    "Connection limit ({}) exceeded for {ip} — dropping",
-                    ctx.max_conns_per_ip
+                    "[{label}] Connection limit ({max}) exceeded for {ip} — dropping",
+                    label = ctx.handler.label,
+                    max = ctx.max_conns_per_ip,
                 );
                 return;
             }
@@ -61,7 +68,10 @@ async fn spawn_handler(tcp: TcpStream, peer: SocketAddr, ctx: &SpawnCtx) {
     };
     let global_permit = match ctx.global_conns.clone().acquire_owned().await {
         Ok(p) => p,
-        Err(_) => return, // semaphore closed, shutting down
+        Err(_) => {
+            debug!("Global semaphore closed — dropping connection from {peer}");
+            return; // semaphore closed, shutting down
+        }
     };
     let handler = ctx.handler.clone();
     tokio::spawn(async move {
@@ -109,6 +119,10 @@ async fn main() -> anyhow::Result<()> {
             .map(|v| config::parse_trusted_proxies(&v))
             .unwrap_or_default(),
     );
+    debug!("Global connection limit: {MAX_GLOBAL_CONNECTIONS}");
+    debug!(
+        "Background tasks: token refresh ({WT_TOKEN_REFRESH_INTERVAL:?}), auth-fail cleanup ({AUTH_FAIL_CLEANUP_INTERVAL:?})"
+    );
 
     // ── TLS + obfs4 identity ────────────────────────────────────────────────
 
@@ -145,6 +159,8 @@ async fn main() -> anyhow::Result<()> {
             "║  trusted_proxies: {} range(s) (auth-fail + conn limits bypassed)",
             trusted_proxies.len()
         );
+    } else {
+        debug!("No trusted proxies configured");
     }
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  obfs4 bridge cert:");

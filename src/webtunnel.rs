@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::{AUTH_PERIOD_SECS, WT_TOKEN_REFRESH_INTERVAL};
 
@@ -73,11 +73,13 @@ impl WtTokenCache {
         let period = current_auth_period();
         let paths = valid_wt_paths_at(bridge_cert, base_path, period);
         let mut w = self.paths.write().unwrap();
+        debug!("WtTokenCache refreshed for period {period} (paths: {paths:?})");
         *w = paths;
     }
 
     pub fn spawn_refresh_task(cache: Arc<WtTokenCache>, bridge_cert: String, base_path: String) {
         tokio::spawn(async move {
+            debug!("WtTokenCache refresh task started (interval: {WT_TOKEN_REFRESH_INTERVAL:?})");
             let mut interval = tokio::time::interval(WT_TOKEN_REFRESH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {

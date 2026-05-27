@@ -2,13 +2,14 @@ use std::path::Path;
 
 use anyhow::Context;
 use construct_ice::ServerConfig;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Build a rustls ClientConfig that trusts OS/system root certificates.
 /// ALPN is set to ["h2"] so the upstream gRPC server negotiates HTTP/2.
 /// Without this, rustls sends no ALPN extension and the server defaults to
 /// HTTP/1.1, causing an immediate close when it receives the HTTP/2 preface.
 pub fn make_upstream_tls_config() -> anyhow::Result<rustls::ClientConfig> {
+    debug!("Loading system root certificates for upstream TLS");
     let mut roots = rustls::RootCertStore::empty();
     let native_certs = rustls_native_certs::load_native_certs();
     if !native_certs.errors.is_empty() {

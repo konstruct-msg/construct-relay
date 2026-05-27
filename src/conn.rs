@@ -4,7 +4,7 @@ use std::sync::Arc;
 use construct_ice::{Obfs4Listener, WebTunnelServerStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{TLS_ACCEPT_TIMEOUT, is_trusted_proxy};
 use crate::ratelimit::AuthFailTable;
@@ -50,18 +50,21 @@ pub fn apply_tcp_keepalive(stream: &TcpStream) {
 /// Handle a single incoming TLS stream: peek the first byte to decide between
 /// WebTunnel (HTTP GET → WebSocket) and obfs4 (encrypted transport).
 pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx) {
+    debug!("[{label}] new connection from {peer}", label = ctx.label);
+
     let tls_stream =
         match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, ctx.tls_acceptor.accept(tcp)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                warn!("TLS handshake failed from {}: {}", peer, e);
+                warn!("[{label}] TLS handshake failed from {peer}: {e}", label = ctx.label);
                 return;
             }
             Err(_) => {
-                warn!("TLS handshake timed out from {}", peer);
+                warn!("[{label}] TLS handshake timed out from {peer}", label = ctx.label);
                 return;
             }
         };
+    debug!("[{label}] TLS handshake ok from {peer}", label = ctx.label);
 
     // Peek the first byte to distinguish WebTunnel (HTTP GET) from obfs4.
     // WebTunnel always opens with "GET /path HTTP/1.1\r\n..." → first byte is b'G'.
@@ -71,7 +74,7 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
     let first = match peek_first_byte(&mut buffered).await {
         Ok(b) => b,
         Err(e) => {
-            warn!("peek failed from {}: {}", peer, e);
+            warn!("[{label}] peek failed from {peer}: {e}", label = ctx.label);
             return;
         }
     };
@@ -79,19 +82,29 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
     if first == b'G' {
         // WebTunnel path: validate time-based auth token derived from bridge cert,
         // then perform WebSocket handshake and relay.
-        info!("WebTunnel connection from {} ({})", peer, ctx.label);
+        info!("WebTunnel connection from {peer} ({label})", label = ctx.label);
         let valid_paths = ctx.wt_cache.get();
 
         // Peek at the HTTP request path without consuming the buffer.
-        let path_ok = {
+        let (path_ok, http_path) = {
             use tokio::io::AsyncBufReadExt;
             match buffered.fill_buf().await {
-                Ok(buf) => extract_http_path(buf)
-                    .map(|p| valid_paths.iter().any(|v| v == p))
-                    .unwrap_or(false),
-                Err(_) => false,
+                Ok(buf) => match extract_http_path(buf) {
+                    Some(p) => (
+                        valid_paths.iter().any(|v| v == p),
+                        Some(p.to_string()),
+                    ),
+                    None => (false, None),
+                },
+                Err(_) => (false, None),
             }
         };
+
+        debug!(
+            "[{label}] WebTunnel path={path:?} auth={path_ok}",
+            label = ctx.label,
+            path = http_path.as_deref().unwrap_or("<parse error>")
+        );
 
         if path_ok {
             match WebTunnelServerStream::accept_validated(buffered, |p| {
@@ -99,8 +112,11 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
             })
             .await
             {
-                Ok(ws) => relay_conn(ws, peer, &ctx.upstream, &ctx.upstream_tls).await,
-                Err(e) => warn!("WebTunnel handshake failed from {}: {}", peer, e),
+                Ok(ws) => {
+                    info!("WebTunnel WS handshake ok from {peer}");
+                    relay_conn(ws, peer, &ctx.upstream, &ctx.upstream_tls).await;
+                }
+                Err(e) => warn!("WebTunnel handshake failed from {peer}: {e}"),
             }
         } else {
             // Unknown path: delay then respond as a generic nginx server.
@@ -108,21 +124,24 @@ pub async fn handle_incoming(tcp: TcpStream, peer: SocketAddr, ctx: &HandlerCtx)
                 ctx.auth_fail.record_failure(peer.ip());
             }
             warn!(
-                "WebTunnel auth rejected from {} — sending decoy response",
-                peer
+                "WebTunnel auth rejected from {peer} — sending decoy response"
             );
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             send_decoy_http_response(&mut buffered).await;
         }
     } else {
         // obfs4 path: existing encrypted transport
+        debug!("[{label}] obfs4 stream from {peer}", label = ctx.label);
         match ctx.obfs4_listener.accept_stream(buffered).await {
-            Ok(s) => relay_conn(s, peer, &ctx.upstream, &ctx.upstream_tls).await,
+            Ok(s) => {
+                info!("obfs4 handshake ok from {peer}");
+                relay_conn(s, peer, &ctx.upstream, &ctx.upstream_tls).await;
+            }
             Err(e) => {
                 if !is_trusted_proxy(peer.ip(), &ctx.trusted_proxies) {
                     ctx.auth_fail.record_failure(peer.ip());
                 }
-                warn!("obfs4 handshake failed from {}: {}", peer, e);
+                warn!("obfs4 handshake failed from {peer}: {e}");
             }
         }
     }
@@ -214,20 +233,20 @@ async fn relay_conn<S: AsyncRead + AsyncWrite + Unpin>(
         };
         match connector.connect(server_name, tcp).await {
             Ok(tls_stream) => {
-                info!("Relay {peer} → upstream {upstream} (TLS) connected");
-                pipe(stream, tls_stream, peer).await;
+                info!("Relay {peer} → {upstream} (TLS) connected");
+                pipe(stream, tls_stream, peer, upstream).await;
             }
             Err(e) => error!("Upstream TLS handshake to {upstream} failed: {e}"),
         }
     } else {
-        info!("Relay {peer} → upstream {upstream} (plain) connected");
-        pipe(stream, tcp, peer).await;
+        info!("Relay {peer} → {upstream} (plain) connected");
+        pipe(stream, tcp, peer, upstream).await;
     }
 }
 
-/// Bidirectional pipe between two read/write streams.  Exits cleanly when
-/// either side closes the connection.
-async fn pipe<A, B>(a: A, b: B, peer: SocketAddr)
+/// Bidirectional pipe between client and upstream.  Logs the close reason
+/// and byte counts for observability.
+async fn pipe<A, B>(a: A, b: B, peer: SocketAddr, upstream: &str)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -239,9 +258,17 @@ where
         tokio::io::copy(&mut ar, &mut bw),
         tokio::io::copy(&mut br, &mut aw),
     ) {
-        Ok((sent, recv)) => info!("Relay closed {} — ↑{}B ↓{}B", peer, sent, recv),
-        Err(e) if is_routine_disconnect(&e) => {}
-        Err(e) => warn!("Relay error for {}: {}", peer, e),
+        Ok((c2s, s2c)) => {
+            info!(
+                "Relay {peer} → {upstream} closed (c2s={c2s}B, s2c={s2c}B)"
+            );
+        }
+        Err(e) if is_routine_disconnect(&e) => {
+            info!("Relay {peer} → {upstream} disconnected ({e})");
+        }
+        Err(e) => {
+            warn!("Relay {peer} → {upstream} error: {e}");
+        }
     }
 }
 

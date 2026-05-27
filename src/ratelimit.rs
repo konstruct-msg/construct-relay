@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::{
     AUTH_FAIL_CLEANUP_INTERVAL, AUTH_FAIL_COOLDOWN, AUTH_FAIL_ENTRY_TTL, AUTH_FAIL_THRESHOLD,
@@ -91,6 +91,7 @@ impl AuthFailTable {
     /// (below threshold and older than AUTH_FAIL_ENTRY_TTL).
     fn cleanup(&self) {
         let mut map = self.0.lock().unwrap();
+        let before = map.len();
         let now = Instant::now();
         map.retain(|_, e| {
             // Cooldown expired → remove.
@@ -101,11 +102,16 @@ impl AuthFailTable {
             // under slow distributed probing with unique source IPs).
             now.duration_since(e.created_at) < AUTH_FAIL_ENTRY_TTL
         });
+        let removed = before.saturating_sub(map.len());
+        if removed > 0 {
+            debug!("AuthFailTable cleanup: removed {removed} entries (remaining: {})", map.len());
+        }
     }
 
     /// Spawn a background task that periodically calls `cleanup()`.
     pub fn spawn_cleanup_task(table: AuthFailTable) {
         tokio::spawn(async move {
+            debug!("AuthFailTable cleanup task started (interval: {AUTH_FAIL_CLEANUP_INTERVAL:?})");
             let mut interval = tokio::time::interval(AUTH_FAIL_CLEANUP_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -122,8 +128,11 @@ impl AuthFailTable {
         if let Some(e) = map.get_mut(&ip) {
             if let Some(until) = e.cooldown_until {
                 if now < until {
+                    debug!("AuthFailTable: {ip} is blocked (cooldown expires in {}s)",
+                        (until - now).as_secs());
                     return true;
                 }
+                debug!("AuthFailTable: {ip} cooldown expired — resetting counter (was {} failures)", e.count);
                 map.remove(&ip); // cooldown expired — reset counter
             }
         }
@@ -147,13 +156,14 @@ impl AuthFailTable {
             } else {
                 newly_blocked = false;
             }
+            if !newly_blocked {
+                debug!("AuthFailTable: {ip} failure #{count} (threshold: {AUTH_FAIL_THRESHOLD})", count = e.count);
+            }
         }
         if newly_blocked {
             warn!(
-                "Auth-fail threshold ({} failures) reached for {} — \
+                "Auth-fail threshold ({AUTH_FAIL_THRESHOLD} failures) reached for {ip} — \
                  dropping new connections for {}h",
-                AUTH_FAIL_THRESHOLD,
-                ip,
                 AUTH_FAIL_COOLDOWN.as_secs() / 3600,
             );
         }
