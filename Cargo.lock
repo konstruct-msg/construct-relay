@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "construct-relay"
-version = "0.3.9"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "construct-ice",

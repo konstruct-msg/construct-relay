@@ -1,5 +1,7 @@
 # ── Build stage ────────────────────────────────────────────────────────────────
-FROM rust:latest AS builder
+# Pinned to Rust 1.87 (matches rust-toolchain.toml).  Do NOT use :latest — it
+# changes without warning and can break edition 2024 compatibility.
+FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /build
 

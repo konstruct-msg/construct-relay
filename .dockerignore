@@ -1,0 +1,29 @@
+# Build output
+/target
+
+# Git
+/.git
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docs / agents
+/AGENTS.md
+/INSPECTION.md
+/wiki/
+
+# Env
+/.env
+
+# Well-known (deployment artifacts, not needed in build)
+/.well-known/
+
+# Deploy configs (host-side only)
+/deploy/

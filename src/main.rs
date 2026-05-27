@@ -1,277 +1,74 @@
+mod config;
+mod conn;
+mod ratelimit;
 mod tls;
+mod upstream;
+mod webtunnel;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
-use construct_ice::{Obfs4Listener, ServerConfig, WebTunnelServerStream};
-use tokio::io::{AsyncRead, AsyncWrite};
+use construct_ice::Obfs4Listener;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
-/// Set TCP keepalive on `stream` so OS-level probes prevent NAT/HAProxy from
-/// treating the connection as idle during silent gRPC periods.
-///
-/// Uses 15 s idle delay + 5 s probe interval so the first keepalive probe fires
-/// well before HAProxy's configured timeout.  SAFETY: the raw fd is only borrowed
-/// for the setsockopt call; `mem::forget` prevents socket2 from closing it.
-#[cfg(unix)]
-fn apply_tcp_keepalive(stream: &TcpStream) {
-    use std::os::fd::AsRawFd;
-    let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(15))
-        .with_interval(Duration::from_secs(5));
-    #[cfg(target_os = "linux")]
-    let ka = ka.with_retries(3);
-    // SAFETY: fd is valid and still owned by `stream`. We forget the Socket so
-    // socket2's Drop impl doesn't close the same fd a second time.
-    use std::os::fd::FromRawFd;
-    let socket = unsafe { socket2::Socket::from_raw_fd(stream.as_raw_fd()) };
-    if let Err(e) = socket.set_tcp_keepalive(&ka) {
-        warn!("set_tcp_keepalive failed: {}", e);
+use crate::config::{
+    DEFAULT_ALT_LISTEN, DEFAULT_LISTEN, DEFAULT_MAX_CONNS_PER_IP, DEFAULT_SNI, DEFAULT_STATE,
+    DEFAULT_WT_PATH, MAX_GLOBAL_CONNECTIONS, is_trusted_proxy,
+};
+use crate::conn::{HandlerCtx, apply_tcp_keepalive, handle_incoming};
+use crate::ratelimit::{AuthFailTable, ConnGuard, ConnTable, try_acquire};
+use crate::webtunnel::{WtTokenCache, current_auth_period, webtunnel_token};
+
+/// Per-accept-loop context that bundles all shared state needed to spawn
+/// a connection handler.  Keeps `spawn_handler` to just 3 arguments.
+struct SpawnCtx {
+    conn_table: ConnTable,
+    auth_fail: AuthFailTable,
+    trusted_proxies: Arc<Vec<(IpAddr, u8)>>,
+    global_conns: Arc<Semaphore>,
+    max_conns_per_ip: usize,
+    handler: HandlerCtx,
+}
+
+/// Shared spawn logic used by both primary and alt accept loops.
+async fn spawn_handler(tcp: TcpStream, peer: SocketAddr, ctx: &SpawnCtx) {
+    #[cfg(unix)]
+    apply_tcp_keepalive(&tcp);
+    let ip = peer.ip();
+    let trusted = is_trusted_proxy(ip, &ctx.trusted_proxies);
+    if !trusted && ctx.auth_fail.is_blocked(ip) {
+        warn!("Auth-cooldown: dropping connection from {ip}");
+        return;
     }
-    std::mem::forget(socket);
-}
-
-const DEFAULT_LISTEN: &str = "0.0.0.0:443";
-const DEFAULT_STATE: &str = "/data";
-const DEFAULT_SNI: &str = "storage.yandexcloud.net";
-/// Neutral WebSocket path that looks like a generic API endpoint.
-/// Override with WT_PATH env var on the relay.  Avoid service-identifying
-/// names — this path appears in HTTP Upgrade requests and is DPI-visible.
-const DEFAULT_WT_PATH: &str = "/api/stream";
-/// Secondary listener port for direct TLS+obfs4 connections that bypass CDN.
-/// Set ALT_LISTEN_ADDR=0.0.0.0:9443 on CDN-fronted relays (e.g. MSK/Yandex Cloud)
-/// so mobile clients can reach the relay without going through the CDN layer.
-/// Uses the same TLS cert, obfs4 identity, and upstream as the primary listener.
-const DEFAULT_ALT_LISTEN: &str = "";
-const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Each auth period is 5 minutes. We accept current ± 1 period (±5 min clock drift).
-const AUTH_PERIOD_SECS: u64 = 300;
-/// Default maximum concurrent connections per IP if MAX_CONNS_PER_IP env var is not set.
-/// HTTP/2 keepalive + happy-eyeballs dual-relay probing + WebTunnel pre-probe means a
-/// single legitimate client can hold 6–12 simultaneous connections.  Set conservatively
-/// high enough to not rate-limit real clients while still blocking floods.
-const DEFAULT_MAX_CONNS_PER_IP: usize = 24;
-/// Number of auth failures before an IP enters cooldown.
-/// Uses a simple cumulative counter (no sliding window) so slow persistent
-/// probers (e.g. one attempt per hour) are caught after exactly N tries.
-const AUTH_FAIL_THRESHOLD: usize = 3;
-/// How long a blocked IP stays in cooldown. Counter resets on expiry.
-const AUTH_FAIL_COOLDOWN: Duration = Duration::from_secs(86_400); // 24 hours
-
-// ---------------------------------------------------------------------------
-// Per-IP connection limiter (RAII guard)
-// ---------------------------------------------------------------------------
-
-type ConnTable = Arc<Mutex<HashMap<IpAddr, usize>>>;
-
-/// RAII guard that decrements the per-IP counter when the connection ends.
-struct ConnGuard {
-    ip: IpAddr,
-    table: ConnTable,
-}
-
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        let mut t = self.table.lock().unwrap();
-        match t.get_mut(&self.ip) {
-            Some(n) if *n <= 1 => {
-                t.remove(&self.ip);
-            }
-            Some(n) => {
-                *n -= 1;
-            }
-            None => {}
-        }
-    }
-}
-
-/// Try to acquire a connection slot for `ip`.  Returns `None` if the limit is reached.
-fn try_acquire(table: &ConnTable, ip: IpAddr, max: usize) -> Option<ConnGuard> {
-    let mut t = table.lock().unwrap();
-    let count = t.entry(ip).or_insert(0);
-    if *count >= max {
-        return None;
-    }
-    *count += 1;
-    Some(ConnGuard {
-        ip,
-        table: Arc::clone(table),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Per-IP auth-failure rate limiter
-// ---------------------------------------------------------------------------
-//
-// Tracks WebTunnel bad-path rejections and obfs4 HMAC failures per source IP.
-// Uses a simple cumulative counter (not a sliding window) so slow persistent
-// probers that stay under the per-hour rate are still caught after N total tries.
-// After AUTH_FAIL_THRESHOLD failures the IP enters AUTH_FAIL_COOLDOWN: incoming
-// TCP connections are dropped immediately (before TLS), saving CPU on obfs4
-// key derivation and WebSocket parsing. Counter resets when the cooldown expires.
-
-#[derive(Default)]
-struct FailEntry {
-    /// Cumulative auth failure count since the entry was created / last reset.
-    count: usize,
-    /// If Some, the IP is blocked until this instant.
-    cooldown_until: Option<Instant>,
-}
-
-#[derive(Clone)]
-struct AuthFailTable(Arc<Mutex<HashMap<IpAddr, FailEntry>>>);
-
-impl AuthFailTable {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(HashMap::new())))
-    }
-
-    /// Returns `true` if the IP is currently in cooldown. Lazily evicts expired entries.
-    fn is_blocked(&self, ip: IpAddr) -> bool {
-        let mut map = self.0.lock().unwrap();
-        let now = Instant::now();
-        if let Some(e) = map.get_mut(&ip) {
-            if let Some(until) = e.cooldown_until {
-                if now < until {
-                    return true;
-                }
-                map.remove(&ip); // cooldown expired — reset counter
+    let guard: Option<ConnGuard> = if trusted {
+        None
+    } else {
+        match try_acquire(&ctx.conn_table, ip, ctx.max_conns_per_ip) {
+            Some(g) => Some(g),
+            None => {
+                warn!(
+                    "Connection limit ({}) exceeded for {ip} — dropping",
+                    ctx.max_conns_per_ip
+                );
+                return;
             }
         }
-        false
-    }
-
-    /// Record an auth failure for `ip`. Logs a warning if cooldown is newly triggered.
-    fn record_failure(&self, ip: IpAddr) {
-        let newly_blocked;
-        {
-            let mut map = self.0.lock().unwrap();
-            let now = Instant::now();
-            let e = map.entry(ip).or_default();
-            e.count += 1;
-            if e.count >= AUTH_FAIL_THRESHOLD && e.cooldown_until.is_none() {
-                e.cooldown_until = Some(now + AUTH_FAIL_COOLDOWN);
-                newly_blocked = true;
-            } else {
-                newly_blocked = false;
-            }
-        }
-        if newly_blocked {
-            warn!(
-                "Auth-fail threshold ({} failures) reached for {} — \
-                 dropping new connections for {}h",
-                AUTH_FAIL_THRESHOLD,
-                ip,
-                AUTH_FAIL_COOLDOWN.as_secs() / 3600,
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Trusted proxy IP ranges (TRUSTED_PROXIES env var)
-// ---------------------------------------------------------------------------
-//
-// When the relay runs behind a local L4 proxy (e.g. nginx stream block, Docker
-// network bridge), all TCP connections appear to originate from the proxy's IP
-// (typically 172.18.0.1 on a Docker bridge network). Rate-limit and per-IP
-// conn tracking by source IP is useless in this case and actively harmful —
-// a single failed auth attempt from any real client can trigger a 24 h ban
-// that blocks ALL subsequent clients going through the same proxy IP.
-//
-// Set TRUSTED_PROXIES to a comma-separated list of IPs or CIDRs that should
-// be exempt from auth-fail rate-limiting and per-IP connection limits.
-// Example: TRUSTED_PROXIES=172.16.0.0/12  (all private Docker bridge ranges)
-
-fn parse_trusted_proxies(raw: &str) -> Vec<(IpAddr, u8)> {
-    raw.split(',')
-        .filter_map(|s| {
-            let s = s.trim();
-            if s.is_empty() {
-                return None;
-            }
-            if let Some((ip_part, prefix_part)) = s.split_once('/') {
-                let ip: IpAddr = ip_part.trim().parse().ok()?;
-                let prefix: u8 = prefix_part.trim().parse().ok()?;
-                Some((ip, prefix))
-            } else {
-                let ip: IpAddr = s.parse().ok()?;
-                let prefix = match ip {
-                    IpAddr::V4(_) => 32,
-                    IpAddr::V6(_) => 128,
-                };
-                Some((ip, prefix))
-            }
-        })
-        .collect()
-}
-
-fn ip_in_cidr(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
-    match (ip, net) {
-        (IpAddr::V4(ip), IpAddr::V4(net)) => {
-            if prefix == 0 {
-                return true;
-            }
-            if prefix >= 32 {
-                return ip == net;
-            }
-            let mask = !0u32 << (32 - prefix);
-            (u32::from(ip) & mask) == (u32::from(net) & mask)
-        }
-        (IpAddr::V6(ip), IpAddr::V6(net)) => {
-            if prefix == 0 {
-                return true;
-            }
-            if prefix >= 128 {
-                return ip == net;
-            }
-            let mask = !0u128 << (128 - prefix);
-            (u128::from(ip) & mask) == (u128::from(net) & mask)
-        }
-        _ => false,
-    }
-}
-
-fn is_trusted_proxy(ip: IpAddr, proxies: &[(IpAddr, u8)]) -> bool {
-    proxies
-        .iter()
-        .any(|&(net, prefix)| ip_in_cidr(ip, net, prefix))
-}
-
-/// Compute a WebTunnel path auth token for a given time period.
-///
-/// Both the relay and the iOS client derive the token identically:
-///   `SHA-256( bridge_cert_base64_string || "webtunnel-v1" || period_u64_be )[:8]`
-/// encoded as 16 lowercase hex characters.  The `bridge_cert` string is the
-/// `cert=...` value from the relay's obfs4 bridge line — available to clients
-/// via the relay manifest they download at startup.
-fn webtunnel_token(bridge_cert: &str, period: u64) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bridge_cert.as_bytes());
-    h.update(b"webtunnel-v1");
-    h.update(period.to_be_bytes());
-    hex::encode(&h.finalize()[..8])
-}
-
-/// Return the set of valid authenticated WebTunnel paths for right now.
-/// Accepts current period ± 1 to tolerate up to 5 minutes of clock drift.
-fn valid_wt_paths(bridge_cert: &str, base_path: &str) -> Vec<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let period = now / AUTH_PERIOD_SECS;
-    // period-1, period, period+1
-    [period.saturating_sub(1), period, period + 1]
-        .iter()
-        .map(|&p| format!("{base_path}/{}", webtunnel_token(bridge_cert, p)))
-        .collect()
+    };
+    let global_permit = match ctx.global_conns.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return, // semaphore closed, shutting down
+    };
+    let handler = ctx.handler.clone();
+    tokio::spawn(async move {
+        handle_incoming(tcp, peer, &handler).await;
+        drop(guard);
+        drop(global_permit);
+    });
 }
 
 #[tokio::main]
@@ -289,10 +86,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // ── Environment ─────────────────────────────────────────────────────────
+
     let upstream = std::env::var("UPSTREAM")
         .context("UPSTREAM env var required (e.g. ams.konstruct.cc:443)")?;
-    // Default: TLS=true. Almost all deployments target port 443 which requires TLS.
-    // Set UPSTREAM_TLS=false only when upstream is a plain HTTP/2 port (rare, internal).
     let upstream_tls = std::env::var("UPSTREAM_TLS")
         .map(|v| !v.eq_ignore_ascii_case("false") && v != "0")
         .unwrap_or(true);
@@ -309,43 +106,40 @@ async fn main() -> anyhow::Result<()> {
     let trusted_proxies: Arc<Vec<(IpAddr, u8)>> = Arc::new(
         std::env::var("TRUSTED_PROXIES")
             .ok()
-            .map(|v| parse_trusted_proxies(&v))
+            .map(|v| config::parse_trusted_proxies(&v))
             .unwrap_or_default(),
     );
 
-    // Build upstream TLS config once (reused for every connection).
+    // ── TLS + obfs4 identity ────────────────────────────────────────────────
+
     let upstream_tls_config = if upstream_tls {
-        Some(Arc::new(make_upstream_tls_config()?))
+        Some(Arc::new(upstream::make_upstream_tls_config()?))
     } else {
         None
     };
 
     let relay_tls = tls::setup(&state_dir, &sni)?;
-    let config = load_or_generate_obfs4(&state_dir)?;
+    let config = upstream::load_or_generate_obfs4(&state_dir)?;
     let bridge_cert = config.bridge_cert();
 
-    // Log the current auth token so operators can verify client-side derivation.
-    let now_period = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / AUTH_PERIOD_SECS;
+    // ── Startup banner ──────────────────────────────────────────────────────
+
+    let now_period = current_auth_period();
 
     info!("╔══════════════════════════════════════════════════════════");
     info!("║  construct-relay  v{}", env!("CARGO_PKG_VERSION"));
     info!("╠══════════════════════════════════════════════════════════");
-    info!("║  listen    {}", listen);
+    info!("║  listen    {listen}");
     if !alt_listen.is_empty() {
-        info!("║  alt-listen {} (TLS+obfs4, CDN bypass)", alt_listen);
+        info!("║  alt-listen {alt_listen} (TLS+obfs4, CDN bypass)");
     }
-    info!("║  upstream  {} (TLS: {})", upstream, upstream_tls);
-    info!("║  TLS SNI   {}", sni);
+    info!("║  upstream  {upstream} (TLS: {upstream_tls})");
+    info!("║  TLS SNI   {sni}");
     info!(
-        "║  wt_path   {}/{} (WebTunnel v2, current token)",
-        wt_path,
+        "║  wt_path   {wt_path}/{} (WebTunnel v2, current token)",
         webtunnel_token(&bridge_cert, now_period)
     );
-    info!("║  max_conns {}/IP", max_conns_per_ip);
+    info!("║  max_conns {max_conns_per_ip}/IP");
     if !trusted_proxies.is_empty() {
         info!(
             "║  trusted_proxies: {} range(s) (auth-fail + conn limits bypassed)",
@@ -354,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  obfs4 bridge cert:");
-    info!("║    {}", bridge_cert);
+    info!("║    {bridge_cert}");
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  TLS SPKI fingerprint (→ iOS ICEConfig.mskRelayPinnedSPKI):");
     info!("║    {}", relay_tls.spki_hex);
@@ -363,400 +157,104 @@ async fn main() -> anyhow::Result<()> {
     info!("║    {}", config.bridge_line());
     info!("╚══════════════════════════════════════════════════════════");
 
+    // ── Bind primary listener ───────────────────────────────────────────────
+
     let listener = Arc::new(Obfs4Listener::bind(&listen, config).await?);
-    info!(
-        "Listening on {} (TLS+obfs4 / WebTunnel / SNI: {})",
-        listen, sni
-    );
+    info!("Listening on {listen} (TLS+obfs4 / WebTunnel / SNI: {sni})");
+
+    // ── Shared state ────────────────────────────────────────────────────────
 
     let conn_table: ConnTable = Arc::new(Mutex::new(HashMap::new()));
-    let auth_fail_table: AuthFailTable = AuthFailTable::new();
+    let auth_fail_table = AuthFailTable::new();
+    let global_conns = Arc::new(Semaphore::new(MAX_GLOBAL_CONNECTIONS));
+    let wt_token_cache = Arc::new(WtTokenCache::new(&bridge_cert, &wt_path));
 
-    // Optional secondary listener: bypasses CDN so raw TLS+obfs4 connections can
-    // reach the relay directly.  Shares the same obfs4 identity and TLS cert as the
-    // primary listener — clients pin the same SPKI fingerprint regardless of port.
-    // Typical deployment: ALT_LISTEN_ADDR=0.0.0.0:9443 on a CDN-fronted relay.
+    // Build the reusable handler context
+    let handler = HandlerCtx {
+        tls_acceptor: relay_tls.acceptor.clone(),
+        obfs4_listener: Arc::clone(&listener),
+        upstream: upstream.clone(),
+        upstream_tls: upstream_tls_config.clone(),
+        wt_cache: Arc::clone(&wt_token_cache),
+        auth_fail: auth_fail_table.clone(),
+        trusted_proxies: Arc::clone(&trusted_proxies),
+        label: "primary".to_string(),
+    };
+
+    let spawn_ctx = SpawnCtx {
+        conn_table: Arc::clone(&conn_table),
+        auth_fail: auth_fail_table.clone(),
+        trusted_proxies: Arc::clone(&trusted_proxies),
+        global_conns: Arc::clone(&global_conns),
+        max_conns_per_ip,
+        handler,
+    };
+
+    // Background tasks
+    WtTokenCache::spawn_refresh_task(
+        Arc::clone(&wt_token_cache),
+        bridge_cert.clone(),
+        wt_path.clone(),
+    );
+    AuthFailTable::spawn_cleanup_task(auth_fail_table.clone());
+
+    // ── Alt listener (optional) ─────────────────────────────────────────────
+
     if !alt_listen.is_empty() {
         let alt_tcp = tokio::net::TcpListener::bind(&alt_listen)
             .await
             .with_context(|| format!("binding ALT_LISTEN_ADDR {alt_listen}"))?;
-        info!(
-            "Alt listener on {} (TLS+obfs4 direct, CDN bypass)",
-            alt_listen
-        );
+        info!("Alt listener on {alt_listen} (TLS+obfs4 direct, CDN bypass)");
 
-        let listener_alt = Arc::clone(&listener);
-        let tls_alt = relay_tls.acceptor.clone();
-        let upstream_alt = upstream.clone();
-        let wt_path_alt = wt_path.clone();
-        let bridge_cert_alt = bridge_cert.clone();
-        let conn_table_alt = Arc::clone(&conn_table);
-        let auth_fail_alt = auth_fail_table.clone();
-        let tls_config_alt = upstream_tls_config.clone();
-        let proxies_alt = Arc::clone(&trusted_proxies);
+        let alt_spawn_ctx = SpawnCtx {
+            conn_table: Arc::clone(&conn_table),
+            auth_fail: auth_fail_table.clone(),
+            trusted_proxies: Arc::clone(&trusted_proxies),
+            global_conns: Arc::clone(&global_conns),
+            max_conns_per_ip,
+            handler: HandlerCtx {
+                tls_acceptor: relay_tls.acceptor.clone(),
+                obfs4_listener: Arc::clone(&listener),
+                upstream: upstream.clone(),
+                upstream_tls: upstream_tls_config.clone(),
+                wt_cache: Arc::clone(&wt_token_cache),
+                auth_fail: auth_fail_table.clone(),
+                trusted_proxies: Arc::clone(&trusted_proxies),
+                label: "alt".to_string(),
+            },
+        };
 
         tokio::spawn(async move {
             loop {
                 match alt_tcp.accept().await {
-                    Ok((tcp, peer)) => {
-                        #[cfg(unix)]
-                        apply_tcp_keepalive(&tcp);
-                        let ip = peer.ip();
-                        let trusted = is_trusted_proxy(ip, &proxies_alt);
-                        if !trusted && auth_fail_alt.is_blocked(ip) {
-                            warn!("Auth-cooldown: dropping connection from {}", ip);
-                            continue;
-                        }
-                        let guard: Option<ConnGuard> = if trusted {
-                            None
-                        } else {
-                            match try_acquire(&conn_table_alt, ip, max_conns_per_ip) {
-                                Some(g) => Some(g),
-                                None => {
-                                    warn!(
-                                        "Alt connection limit ({}) exceeded for {} — dropping",
-                                        max_conns_per_ip, ip
-                                    );
-                                    continue;
-                                }
-                            }
-                        };
-                        let acceptor = tls_alt.clone();
-                        let listener2 = Arc::clone(&listener_alt);
-                        let upstream = upstream_alt.clone();
-                        let wt_path = wt_path_alt.clone();
-                        let bridge_cert = bridge_cert_alt.clone();
-                        let tls_cfg = tls_config_alt.clone();
-                        let auth_fail = auth_fail_alt.clone();
-                        let proxies = Arc::clone(&proxies_alt);
-                        tokio::spawn(async move {
-                            handle_conn(
-                                tcp,
-                                peer,
-                                acceptor,
-                                listener2,
-                                upstream,
-                                wt_path,
-                                bridge_cert,
-                                tls_cfg,
-                                auth_fail,
-                                proxies,
-                            )
-                            .await;
-                            drop(guard);
-                        });
-                    }
-                    Err(e) => warn!("Alt listener TCP accept error: {}", e),
+                    Ok((tcp, peer)) => spawn_handler(tcp, peer, &alt_spawn_ctx).await,
+                    Err(e) => warn!("alt TCP accept error: {e}"),
                 }
             }
         });
     }
 
-    loop {
-        match listener.accept_tcp().await {
-            Ok((tcp, peer)) => {
-                #[cfg(unix)]
-                apply_tcp_keepalive(&tcp);
-                let ip = peer.ip();
-                let trusted = is_trusted_proxy(ip, &trusted_proxies);
-                if !trusted && auth_fail_table.is_blocked(ip) {
-                    warn!("Auth-cooldown: dropping connection from {}", ip);
-                    continue;
-                }
-                let guard: Option<ConnGuard> = if trusted {
-                    None
-                } else {
-                    match try_acquire(&conn_table, ip, max_conns_per_ip) {
-                        Some(g) => Some(g),
-                        None => {
-                            warn!(
-                                "Connection limit ({}) exceeded for {} — dropping",
-                                max_conns_per_ip, ip
-                            );
-                            continue;
-                        }
-                    }
-                };
-                let acceptor = relay_tls.acceptor.clone();
-                let listener2 = Arc::clone(&listener);
-                let upstream = upstream.clone();
-                let wt_path = wt_path.clone();
-                let bridge_cert = bridge_cert.clone();
-                let upstream_tls_cfg = upstream_tls_config.clone();
-                let auth_fail = auth_fail_table.clone();
-                let proxies = Arc::clone(&trusted_proxies);
-                tokio::spawn(async move {
-                    handle_conn(
-                        tcp,
-                        peer,
-                        acceptor,
-                        listener2,
-                        upstream,
-                        wt_path,
-                        bridge_cert,
-                        upstream_tls_cfg,
-                        auth_fail,
-                        proxies,
-                    )
-                    .await;
-                    drop(guard); // release slot when connection ends
-                });
-            }
-            Err(e) => warn!("TCP accept error: {}", e),
-        }
-    }
-}
+    // ── Primary accept loop ─────────────────────────────────────────────────
 
-async fn handle_conn(
-    tcp: TcpStream,
-    peer: SocketAddr,
-    tls_acceptor: tokio_rustls::TlsAcceptor,
-    obfs4_listener: Arc<Obfs4Listener>,
-    upstream: String,
-    wt_path: String,
-    bridge_cert: String,
-    upstream_tls: Option<Arc<rustls::ClientConfig>>,
-    auth_fail: AuthFailTable,
-    trusted_proxies: Arc<Vec<(IpAddr, u8)>>,
-) {
-    let tls_stream = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, tls_acceptor.accept(tcp)).await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn!("TLS handshake failed from {}: {}", peer, e);
-            return;
-        }
-        Err(_) => {
-            warn!("TLS handshake timed out from {}", peer);
-            return;
-        }
-    };
-
-    // Peek the first byte to distinguish WebTunnel (HTTP GET) from obfs4.
-    // WebTunnel always opens with "GET /path HTTP/1.1\r\n..." → first byte is b'G'.
-    // obfs4 sends random-looking bytes that never start with b'G' in practice,
-    // but we fall back gracefully even if they do (obfs4 accept will just fail).
-    let mut buffered = tokio::io::BufReader::with_capacity(8192, tls_stream);
-    let first = match peek_first_byte(&mut buffered).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("peek failed from {}: {}", peer, e);
-            return;
-        }
-    };
-
-    if first == b'G' {
-        // WebTunnel path: validate time-based auth token derived from bridge cert,
-        // then perform WebSocket handshake and relay.
-        info!("WebTunnel connection from {}", peer);
-        let valid_paths = valid_wt_paths(&bridge_cert, &wt_path);
-
-        // Peek at the HTTP request path without consuming the buffer.
-        // fill_buf() fills the internal 8 KiB buffer but does NOT advance the read
-        // position, so accept_validated() will see the same bytes on its own reads.
-        let path_ok = {
-            use tokio::io::AsyncBufReadExt;
-            match buffered.fill_buf().await {
-                Ok(buf) => extract_http_path(buf)
-                    .map(|p| valid_paths.iter().any(|v| v == p))
-                    .unwrap_or(false),
-                Err(_) => false,
-            }
-        };
-
-        if path_ok {
-            match WebTunnelServerStream::accept_validated(buffered, |p| {
-                valid_paths.iter().any(|v| v == p)
-            })
-            .await
-            {
-                Ok(ws) => relay_conn(ws, peer, upstream, upstream_tls).await,
-                Err(e) => warn!("WebTunnel handshake failed from {}: {}", peer, e),
-            }
-        } else {
-            // Unknown path: delay then respond as a generic nginx server.
-            // The delay makes automated path enumeration ~500× slower.
-            // The HTTP response hides the relay from internet scanners (Shodan, Censys).
-            if !is_trusted_proxy(peer.ip(), &trusted_proxies) {
-                auth_fail.record_failure(peer.ip());
-            }
-            warn!(
-                "WebTunnel auth rejected from {} — sending decoy response",
-                peer
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            send_decoy_http_response(&mut buffered).await;
-        }
-    } else {
-        // obfs4 path: existing encrypted transport
-        match obfs4_listener.accept_stream(buffered).await {
-            Ok(s) => relay_conn(s, peer, upstream, upstream_tls).await,
-            Err(e) => {
-                if !is_trusted_proxy(peer.ip(), &trusted_proxies) {
-                    auth_fail.record_failure(peer.ip());
-                }
-                warn!("obfs4 handshake failed from {}: {}", peer, e);
+    let primary_accept = tokio::spawn(async move {
+        loop {
+            match spawn_ctx.handler.obfs4_listener.accept_tcp().await {
+                Ok((tcp, peer)) => spawn_handler(tcp, peer, &spawn_ctx).await,
+                Err(e) => warn!("primary TCP accept error: {e}"),
             }
         }
-    }
-}
+    });
 
-async fn peek_first_byte<S: AsyncRead + Unpin>(
-    reader: &mut tokio::io::BufReader<S>,
-) -> std::io::Result<u8> {
-    use tokio::io::AsyncBufReadExt;
-    let buf = reader.fill_buf().await?;
-    buf.first()
-        .copied()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty TLS stream"))
-}
+    // ── Graceful shutdown ───────────────────────────────────────────────────
 
-/// Extract the HTTP request path from bytes already in the BufReader's buffer.
-/// Parses the request line "GET /path HTTP/1.1" and returns "/path".
-/// Does not advance the buffer's read position.
-fn extract_http_path(buf: &[u8]) -> Option<&str> {
-    let line_end = buf.iter().position(|&b| b == b'\r' || b == b'\n')?;
-    let line = std::str::from_utf8(&buf[..line_end]).ok()?;
-    let mut parts = line.splitn(3, ' ');
-    let _method = parts.next()?;
-    parts.next()
-}
-
-/// Respond with a minimal nginx-like 404 page to hide the relay from internet scanners.
-/// Called when a WebTunnel connection arrives with an invalid (unrecognised) path.
-/// Using `reader.get_mut()` writes directly to the underlying TLS stream without
-/// disturbing the BufReader's unread buffer (which the scanner never reads anyway).
-async fn send_decoy_http_response<S: AsyncRead + AsyncWrite + Unpin>(
-    reader: &mut tokio::io::BufReader<S>,
-) {
-    use tokio::io::AsyncWriteExt;
-    // Matches the default nginx 404 page byte-for-byte (body length = 153 bytes).
-    const BODY: &[u8] = b"<html>\r\n\
-<head><title>404 Not Found</title></head>\r\n\
-<body>\r\n\
-<center><h1>404 Not Found</h1></center>\r\n\
-<hr><center>nginx/1.24.0</center>\r\n\
-</body>\r\n\
-</html>\r\n";
-    let head = format!(
-        "HTTP/1.1 404 Not Found\r\n\
-Server: nginx/1.24.0\r\n\
-Content-Type: text/html; charset=utf-8\r\n\
-Content-Length: {}\r\n\
-Connection: close\r\n\r\n",
-        BODY.len()
-    );
-    let stream = reader.get_mut();
-    let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(BODY).await;
-    let _ = stream.flush().await;
-}
-
-async fn relay_conn<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: S,
-    peer: SocketAddr,
-    upstream: String,
-    upstream_tls: Option<Arc<rustls::ClientConfig>>,
-) {
-    let tcp = match tokio::net::TcpStream::connect(&upstream).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Upstream connect ({}) for {}: {}", upstream, peer, e);
-            return;
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {
+            info!("Received shutdown signal — draining active connections...");
+            primary_accept.abort();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            info!("Shutdown complete.");
         }
-    };
-    #[cfg(unix)]
-    apply_tcp_keepalive(&tcp);
-
-    if let Some(tls_config) = upstream_tls {
-        // Re-encrypt to upstream with TLS (required when UPSTREAM is a TLS port).
-        let hostname = upstream.split(':').next().unwrap_or(&upstream).to_string();
-        let connector = tokio_rustls::TlsConnector::from(tls_config);
-        let server_name = match rustls::pki_types::ServerName::try_from(hostname.as_str()) {
-            Ok(n) => n.to_owned(),
-            Err(e) => {
-                error!("Invalid upstream hostname '{}': {}", hostname, e);
-                return;
-            }
-        };
-        match connector.connect(server_name, tcp).await {
-            Ok(tls_stream) => {
-                info!("Relay {} → upstream {} (TLS) connected", peer, upstream);
-                pipe(stream, tls_stream, peer).await;
-            }
-            Err(e) => error!("Upstream TLS handshake to {} failed: {}", upstream, e),
-        }
-    } else {
-        info!("Relay {} → upstream {} (plain) connected", peer, upstream);
-        pipe(stream, tcp, peer).await;
+        Err(e) => error!("Failed to listen for shutdown signal: {e}"),
     }
-}
-
-async fn pipe<A, B>(a: A, b: B, peer: SocketAddr)
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut ar, mut aw) = tokio::io::split(a);
-    let (mut br, mut bw) = tokio::io::split(b);
-
-    match tokio::try_join!(
-        tokio::io::copy(&mut ar, &mut bw),
-        tokio::io::copy(&mut br, &mut aw),
-    ) {
-        Ok((sent, recv)) => info!("Relay closed {} — ↑{}B ↓{}B", peer, sent, recv),
-        Err(e) if is_routine_disconnect(&e) => {}
-        Err(e) => warn!("Relay error for {}: {}", peer, e),
-    }
-}
-
-fn is_routine_disconnect(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        ConnectionReset | BrokenPipe | ConnectionAborted | UnexpectedEof
-    )
-}
-
-/// Build a rustls ClientConfig that trusts OS/system root certificates.
-/// ALPN is set to ["h2"] so the upstream gRPC server negotiates HTTP/2.
-/// Without this, rustls sends no ALPN extension and the server defaults to
-/// HTTP/1.1, causing an immediate close when it receives the HTTP/2 preface.
-fn make_upstream_tls_config() -> anyhow::Result<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    let native_certs = rustls_native_certs::load_native_certs();
-    if !native_certs.errors.is_empty() {
-        for e in &native_certs.errors {
-            warn!("Native cert load warning: {}", e);
-        }
-    }
-    for cert in native_certs.certs {
-        roots.add(cert).ok(); // skip invalid certs silently
-    }
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    // gRPC requires HTTP/2; advertise it via ALPN so the upstream server
-    // negotiates h2 instead of falling back to http/1.1.
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok(config)
-}
-
-fn load_or_generate_obfs4(state_dir: &str) -> anyhow::Result<ServerConfig> {
-    let path = format!("{state_dir}/relay.obfs4");
-    let p = Path::new(&path);
-    if p.exists() {
-        let bytes = std::fs::read(p).with_context(|| format!("reading {path}"))?;
-        let cfg = ServerConfig::from_bytes(&bytes)
-            .map_err(|e| anyhow::anyhow!("corrupt obfs4 state file: {}", e))?;
-        info!("Loaded obfs4 identity from {path}");
-        Ok(cfg)
-    } else {
-        let cfg = ServerConfig::generate();
-        std::fs::create_dir_all(state_dir)
-            .with_context(|| format!("creating state dir {state_dir}"))?;
-        std::fs::write(p, cfg.to_bytes()).with_context(|| format!("writing {path}"))?;
-        info!("Generated new obfs4 identity → {path}");
-        Ok(cfg)
-    }
+    Ok(())
 }
