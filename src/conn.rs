@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use construct_ice::{Obfs4Listener, WebTunnelServerStream};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
@@ -259,8 +259,8 @@ where
     let (mut br, mut bw) = tokio::io::split(b);
 
     match tokio::try_join!(
-        tokio::io::copy(&mut ar, &mut bw),
-        tokio::io::copy(&mut br, &mut aw),
+        copy_flush(&mut ar, &mut bw),
+        copy_flush(&mut br, &mut aw),
     ) {
         Ok((c2s, s2c)) => {
             info!("Relay {peer} → {upstream} closed (c2s={c2s}B, s2c={s2c}B)");
@@ -271,6 +271,35 @@ where
         Err(e) => {
             warn!("Relay {peer} → {upstream} error: {e}");
         }
+    }
+}
+
+/// Copy bytes from one half of the relay to the other and flush every chunk.
+///
+/// `tokio::io::copy` does not flush after writes. That is fine for plain TCP,
+/// but our relay endpoints can be TLS, WebTunnel, and obfs4 streams. obfs4 IAT
+/// mode intentionally queues framed bytes until `poll_flush`, so a no-flush copy
+/// loop can keep small upstream frames (including gRPC initial headers) buffered
+/// until much later traffic arrives. Flushing after each chunk preserves
+/// streaming semantics through the relay.
+async fn copy_flush<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut buf = [0_u8; 16 * 1024];
+    let mut total = 0_u64;
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            writer.shutdown().await?;
+            return Ok(total);
+        }
+
+        writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
+        total += n as u64;
     }
 }
 
